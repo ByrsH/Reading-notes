@@ -199,7 +199,102 @@ final 修饰变量时，初衷是告诉编译器：这个变量生而不变，�
 在Java语言里面， Happens-Before 的语义本质上是一种可见性， A Happens-Before B，意味着A事件对B事件来说是可见的，无论A事件和B事件是否发生在同一个线程里。
 
 
+## 03|互斥锁（上）：解决原子性问题
 
+原子性问题的源头是线程切换，那么禁用线程切换就可以解决原子性问题。操作系统做线程切换是依赖CPU中断的，所以禁止CPU发生中断就能禁止线程切换。
+
+在单核CPU时代，禁止CPU中断，可以保证线程不间断地执行，从而保证操作的原子性。但是在多核CPU场景下，当有两个线程同时在执行，禁止CPU中断能保证两个线程不间断执行，但是不能保证同一时刻只有一个线程执行，如果两个线程同时对一个变量进行操作的话，那么就有可能出现bug。
+
+**同一时刻只有一个线程执行**，我们称之为**互斥**。如果能够保证对共享变量的修改是互斥的，那么，无论是单核CPU还是多核CPU，就都能保证原子性了。
+
+
+### 简易锁模型
+
+![](https://img-blog.csdnimg.cn/20190310152713394.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
+
+把一段需要互斥执行的代码称为临界区。
+
+### 改进后的锁模型
+
+![](https://img-blog.csdnimg.cn/20190310152743462.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
+
+锁和被保护资源间是有对应关系的。注意防止出现类似锁自家门来保护他家资源的问题。
+
+
+### Java 语言提供的锁技术：synchronized
+
+锁是一种通用的技术方案，Java语言提供的synchronized关键字，就是锁的一种实现。synchronized 关键字既可以用来修饰方法，也可以用来修饰代码块。
+
+
+    class X {
+      // 修饰非静态方法
+      synchronized void foo() {
+    	// 临界区
+      }
+      // 修饰静态方法
+      synchronized static void bar() {
+    	// 临界区
+      }
+      // 修饰代码块
+      Object obj = new Object()；
+      void baz() {
+    	synchronized(obj) {
+      		// 临界区
+    	}
+      }
+    }  
+
+Java 的一条隐式规则：
+
+- 当synchronized 修饰静态方法的时候，锁定的是当前类的class 对象， 在上面的例子中就是 class X；
+- 当synchronized 修饰非静态方法的时候，锁定的是当前实例对象this。
+
+
+### 用 synchronized 解决 count+=1 问题
+
+    
+    class SafeCalc {
+      long value = 0L;
+      synchronized long get() {
+    	return value;
+      }
+      synchronized void addOne() {
+    	value += 1;
+      }
+    }
+    
+![](https://img-blog.csdnimg.cn/20190310153042244.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
+
+addOne() 方法用synchronized 修饰，既保证了 value += 1 操作时原子性的，又保证了共享变量value 对其它线程的可见性。原因是根据管程中锁的规则：对一个锁的解锁 Happens-Before 于后续对这个锁的加锁。
+
+get() 方法用 synchronized 修饰，保证了value 值的可见性。
+
+
+### 锁和受保护资源的关系
+
+受保护资源和锁之间的关联关系是 N:1 的关系。一个锁可以锁多个资源，但是多个锁不能锁一个资源。
+
+    class SafeCalc {
+      static long value = 0L;
+      synchronized long get() {
+    	return value;
+      }
+      synchronized static void addOne() {
+    	value += 1;
+      }
+    }
+
+![](https://img-blog.csdnimg.cn/2019031015311343.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
+
+上面的例子中，get() 方法加的是 this 锁， addOne() 方法加的是 SafeCalc.class 锁，它们都保护 value 资源。但是由于是不同的锁，因此两个临界区就没有互斥关系，就导致了addOne() 方法对value的操作对临界区 get() 没有可见性保证，从而导致并发问题。
+
+
+### 总结
+
+synchronized 是Java在语言层面提供的互斥原语。锁一定有一个要锁定的对象。
+
+
+## 04 | 互斥锁（下）：如何用一把锁保护多个资源？
 
 
 
