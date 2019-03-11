@@ -296,18 +296,105 @@ synchronized 是Java在语言层面提供的互斥原语。锁一定有一个要
 
 ## 04 | 互斥锁（下）：如何用一把锁保护多个资源？
 
+### 保护没有关联关系的多个资源
+
+    
+    class Account {
+      // 锁：保护账户余额
+      private final Object balLock
+    	= new Object();
+      // 账户余额  
+      private Integer balance;
+      // 锁：保护账户密码
+      private final Object pwLock
+    	= new Object();
+      // 账户密码
+      private String password;
+    
+      // 取款
+      void withdraw(Integer amt) {
+    	synchronized(balLock) {
+      		if (this.balance > amt){
+    			this.balance -= amt;
+      		}
+    	}
+      }
+      // 查看余额
+      Integer getBalance() {
+    	synchronized(balLock) {
+      		return balance;
+    	}
+      }
+    
+      // 更改密码
+      void updatePassword(String pw){
+    	synchronized(pwLock) {
+      		this.password = pw;
+   	 	}
+      }
+      // 查看密码
+      String getPassword() {
+    	synchronized(pwLock) {
+      		return password;
+    	}
+      }
+    }
+
+上面展示的是用不同的锁对受保护资源进行精细化管理，能够提升性能。这种锁也叫细粒度锁。
+
+如果在每个方法前面加一个synchronized 关键字，就是用 this 这一把锁来管理账户里的所有资源。但是这样会导致性能问题，取款、查看余额、修改密码、查看密码这四个操作都是串行的。
+
+### 保护有关联关系的多个资源
+
+    class Account {
+      private int balance;
+      // 转账
+      synchronized void transfer(
+      		Account target, int amt){
+    	if (this.balance > amt) {
+      		this.balance -= amt;
+      		target.balance += amt;
+    	}
+      }
+    }
+
+上面的例子并不能保护临界区内的target.balance 资源，只能保护 this.balance 资源，因为锁是this。另一个线程中target对象的锁是另一个了，它们之间没有互斥。
+
+![](https://img-blog.csdnimg.cn/20190311234134365.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
+
+如果两个线程分别在两个CPU上执行，账户A，B，C都有200元余额，线程1执行账户A转账户B100元，线程2执行账户B转账户C100元，两个线程并不是互斥的，因此就可能出现账户B的余额可能是300，也可能是100。当两个线程同时进入临界区transfer，线程1执行完后B的余额是300（CPU缓存中），线程2执行完后B的余额是100（CPU缓存中），当线程1先写入内存，线程2后写入覆盖，账户B的余额就是100。当线程2线写入内存，线程1后写入覆盖，账户B的余额就是300。
+
+![](https://img-blog.csdnimg.cn/20190311234241313.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
 
 
+### 使用一个锁来保护多个资源的正确方式
+
+一个锁来保护多个资源的关键是：锁能覆盖所有受保护资源。
+
+上面的例子修改，所有的对象都的transfer方法执行都要对同一个Account.class 加锁，因此它们之间是互斥的。
 
 
+    class Account {
+      private int balance;
+      // 转账
+      void transfer(Account target, int amt){
+    	synchronized(Account.class) {
+      		if (this.balance > amt) {
+    			this.balance -= amt;
+    			target.balance += amt;
+      		}
+    	}
+      }
+    }
 
 
+![](https://img-blog.csdnimg.cn/2019031123451817.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
 
+### 总结
 
+当要保护多个资源时，关键要分析多个资源之间的关系。如果资源之间没有关系，那么就每个资源都有一把锁。如果资源之间有关联关系，就要选择一个粒度更大的锁，这个锁应该能够覆盖所有相关的资源。
 
-
-
-
+原子性的本质是多个资源间有一致性的要求，操作的中间状态对外不可见。解决原子性问题，是要保证中间状态对外不可见。
 
 
 
