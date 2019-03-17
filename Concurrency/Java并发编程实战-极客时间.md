@@ -398,6 +398,97 @@ synchronized 是Java在语言层面提供的互斥原语。锁一定有一个要
 
 
 
+## 05 | 一不小心就死锁了，怎么办？
+
+上篇文章中以 Account.class 作为互斥锁，来解决银行业务里的转账问题，虽然这个方案不存在并发问题，但是所有的转账操作都是串行的，存在很大的性能问题。
+
+### 向现实世界要答案
+
+在现实世界中，账户转账是支持并发的，并且是可以并行的。那对应于上篇文章的例子如何实现呢？可以通过两把锁来实现，在transfer() 方法内部，先使用 this锁锁住转出账户，再使用target锁锁住转入账户，只有两者都成功时，才执行转账操作。
+
+![](https://img-blog.csdnimg.cn/20190317174932707.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
+
+
+注意：下面的代码可能会产生死锁
+
+    class Account {
+      private int balance;
+      // 转账
+      void transfer(Account target, int amt){
+    	// 锁定转出账户
+    	synchronized(this) {  
+      		// 锁定转入账户
+      		synchronized(target) {   
+    			if (this.balance > amt) {
+      				this.balance -= amt;
+      				target.balance += amt;
+    			}
+      		}
+    	}
+      }
+    }
+
+
+### 没有免费的午餐
+
+使用细粒度的锁可以提高并行度，是性能优化的一个重要手段。但它的代价就是可能会导致死锁。
+
+![](https://img-blog.csdnimg.cn/20190317175226788.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
+
+
+死锁：一组互相竞争资源的线程因互相等待，导致“永久”阻塞的现象。
+
+![](https://img-blog.csdnimg.cn/20190317175404838.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
+
+
+### 如何预防死锁
+
+当下面这四个条件都放生时才会出现死锁：
+
+
+1. 互斥，共享资源 X 和 Y 只能被一个线程占用；
+2. 占有且等待，线程 T1 已经取得共享资源 X，在等待共享资源 Y 的时候，不释放共享资源 X；
+3. 不可抢占，其他线程不能强行抢占线程 T1 占有的资源；
+4. 循环等待，线程 T1 等待线程 T2占有的资源，线程T2 等待线程 T1 占有的资源，就是循环等待。
+
+
+只要破坏其中一个条件，就可以避免死锁的发生。
+
+#### 1.破坏占用且等待条件
+
+要破坏这个条件，可以一次性申请所有资源。
+
+
+#### 2.破坏不可抢占条件
+
+synchronized如果申请不到资源就会进入阻塞状态，同时线程已经占有的资源也不会释放。但是在 java.util.concurrent包下面提供的Lock是可以轻松解决这个问题。
+
+
+#### 3.破坏循环等待条件
+
+破坏这个条件，需要对资源进行排序，然后按序申请资源。
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
