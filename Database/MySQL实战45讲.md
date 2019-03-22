@@ -261,6 +261,101 @@ max_connections 参数，用来控制一个MySQL实例同时存在的连接数�
 如果是因功能引起的，最理想的情况是让业务把新功能下掉。
 
 
+## 23 | MySQL是怎么保证数据不丢的？
+
+只要 redo log 和 binlog 保证持久化到磁盘，就能确保MySQL异常重启后，数据可以恢复。
+
+binlog的写入机制
+
+binlog的写入逻辑：事务执行过程中，先把日志写到 binlog cache，事务提交的时候，再把 binlog cache 写到 binlog 文件中。
+
+![](https://img-blog.csdnimg.cn/201903230102392.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
+
+每个线程都有自己的 binlog cache，但是共用一份 binlog 文件。
+
+- 图中write，指的是把日志写入到文件系统的 page cache，由于是写入内存，并没有把数据持久化到磁盘，因此速度比较快
+- 图中的fsync，才是将数据持久化到磁盘的操作。一般情况下，我们认为 fsync 才占磁盘的 IOPS。
+
+
+write 和 fsync 的时机，是由参数 sync_binlog 控制的：
+
+1. 当 sync_binlog=0时，表示每次提交事务都只write，不fsync；
+2. 当 sync_binlog=1时，表示每次提交事务都会执行 fsync；
+3. 当 sync_binlog=N(N>1)时，表示每次提交事务都write，但累积N个事物后才fsync。
+
+因此在出现IO瓶颈的场景中，将 sync_binlog 设置成一个比较大的值，可以提升性能。考虑到丢失日志量的可控性，比较常见的是将其设置为 100~1000 中的某个值。
+
+将 sync_binlog 设置为N，对应的风险是：如果主机发生异常重启，会丢失最近N个事务的binlog日志。
+
+
+### redo log 的写入机制
+
+事务在执行过程中，生成的redo log 是要先写到 redo log buffer，并不是每次写入redo log buffer都要直接持久化到磁盘。在事务还没提交的时候，redo log buffer 中的部分日志有可能被持久化到磁盘。
+
+redo log可能存在的三种状态：
+![](https://img-blog.csdnimg.cn/20190323010517216.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
+
+1、存在redo log buffer中，物理上是在MySQL进程内存中，也就是图中的红色部分；
+2、写到磁盘（write），但是没有持久化（fsync），物理上是在文件系统的page cache 里面，也就是图中黄色部分；
+3、持久化到磁盘，对应的是 hard disk，也就是图中绿色部分。
+
+日志写到redo log buffer是很快的，write到 page cache 也很快，但是持久化到磁盘就慢很多了。
+
+InnoDB提供了 innodb_flush_log_at_trx_commit 参数来控制 redo log的写入策略，它有三种可能的取值：
+
+1. 设置为0时，表示每次事物提交时都只是把redo log留在 redo log buffer 中；
+2. 设置为1时，表示每次事务提交时都将 redo log 直接持久化到磁盘；
+3. 设置为2时，表示每次事物提交时都只是把redo log 写到 page cache。
+
+InnoDB有一个后台线程，每隔1秒，就会把 redo log buffer中的日志，调用write 写到文件系统的 page cache，然后调用 fsync 持久化到磁盘。
+
+**注意**，事务在执行过程中的 redo log 也是会直接写入 redo log buffer中的，这些 redo log 也会被后台线程一起持久化到磁盘。也就是说，一个还没提交的事物的 redo log，也是可能被持久化到磁盘的。
+
+除了后台线程每秒一次的轮询操作外，还有两种场景会把一个没提交事物的 redo log 写入到磁盘中。
+
+1. redo log buffer 占用的空间即将达到 innodb_log_buffer_size 一半的时候，后台线程会主动写盘。由于这个事物并没有提交，所以只调用 write， 而没有调用 fsync。redo log留在了 page cache。
+2. 并行事务提交时，顺带将这个事务的 redo log buffer 持久化到磁盘。事务A执行到一半，事务B提交，如果 innodb_flush_log_at_trx_commit 参数设置为1，那么事务B要不 redo log buffer 里的日志持久化到磁盘。这时就会带上 事务A 在 redo log buffer中的日志一起持久化到磁盘。
+
+两阶段提交：redo log 先 prepare，再写 binlog， 最后再把 redo log commit。
+
+双1配置指的是将 sync_binlog 和 innodb_flush_log_at_trx_commit 都设置成1。也就是说，一个事务完整提交前，需要等待两次刷盘，一次是 redo log（prepare阶段），一次是binlog。
+
+日志逻辑序列号（log sequence number）LSN是单调递增的，用来对应 redo log 的一个个写入点。每写入length长度的redo log， LSN的值就会增加 length。
+
+组提交：
+![](https://img-blog.csdnimg.cn/2019032301085238.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
+![](https://img-blog.csdnimg.cn/20190323011000512.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
+
+上图是三个并发事务（trx1、trx2、trx3）在 prepare 阶段，都写完了 redo log buffer，持久化到磁盘的过程，对应的LSN分别是 50、120、160。
+
+1. trx1是第一个到达的，会被选为这组的leader；
+2. 等 trx1 要开始写盘时，这个组里已经有了三个事务，这时候 LSN 也变成了160；
+3. trx1去写盘时，带的就是LSN=160，因此等 trx1 返回时，LSN小于160的redo log ，都已经持久化到磁盘了；
+4. 这时 trx2 和 trx3 可以直接返回了。
+
+因此，一次组提交里面，组员越多，节约磁盘 IOPS 的效果越好。
+
+MySQL为了让组提交的效果更好，把redo log做fsync的时间拖到了步骤1之后。
+![](https://img-blog.csdnimg.cn/20190323011208147.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
+
+这样一来 binlog 也可以组提交了，不过由于第3步执行的很快，导致能集合到一起持久化的binlog比较少。如果想提升 binlog 组提交的效果，可以通过设置 binlog_group_commit_sync_delay 和 binlog_group_commit_sync_no_delay_count 来实现。
+
+1、binlog_group_commit_sync_delay参数表示延迟多少个微秒后才调用 fsync；
+2、binlog_group_commit_sync_no_delay_count 参数，表示累计多少次后才调用 fsync。
+
+两个条件是或的关系，也就是只要满足其中一个就会调用 fsync。
+
+WAL机制主要得益于两个方面：
+
+1. redo log 和 binlog 都是顺序写，磁盘的顺序写比随机写速度快；
+2. 组提交机制，可以大幅降低磁盘的 IOPS 消耗。
+
+
+如果你的MySQL出现性能瓶颈，而且瓶颈在IO上，那么可以通过下面三种方法提升性能：
+
+1. 设置binlog_group_commit_sync_delay 和 binlog_group_commit_sync_no_delay_count参数，减少binlog的写盘次数。这个方法是基于“额外的故意等待”来实现的，因此可能会增加语句的响应时间，但没有丢失数据的风险。
+2. 将 sync_binlog 设置为大于1的值（比较常见的是 100 ~ 1000）。这样做的风险是，主机掉电时会丢binlog日志。
+3. 将 innodb_flush_log_at_trx_commit 设置为2，这样做的风险是，主机掉电的时候会丢失数据。
 
 
 
