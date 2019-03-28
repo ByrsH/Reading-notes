@@ -358,6 +358,89 @@ WAL机制主要得益于两个方面：
 3. 将 innodb_flush_log_at_trx_commit 设置为2，这样做的风险是，主机掉电的时候会丢失数据。
 
 
+## 24 | MySQL是怎么保证主备一致的？
+
+MySQL主备的基本原理
+![](https://img-blog.csdnimg.cn/20190328202726170.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
+
+
+在状态1中，客户端读写都直接访问节点A，而节点B是A的备库，只是将A的更新都同步过来，到本地执行。建议将节点B（备库）设置成只读（readonly）模式。原因如下：
+
+1. 有时候一些查询会被放到备库上查询，设置只读可以防止误操作；
+2. 防止切换逻辑有bug，比如切换过程中出现双写，造成主备不一致；
+3. 可以用readonly状态，来判断节点的角色。
+
+一条更新语句从节点A到节点B的内部流程：
+![](https://img-blog.csdnimg.cn/20190328202758808.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
+
+备库B和主库A之间维持了一个长连接。主库A内部有一个线程，专门用于服务备库B的这个长连接。一个事务日志同步过程是这样的：
+
+1. 在备库B上通过 change master 命令，设置主库A的IP、端口、用户名、密码，以及要从哪个位置开始请求binlog，这个位置包含文件名和日志偏移量。
+2. 在备库B上执行 start slave 命令，这时候备库会启动两个线程，就是图中的 io_thread 和 sql_thread。其中 io_thread 负责与主库建立连接。
+3. 主库A校验完用户名、密码后，开始按照备库B传过来的位置，从本地读取binlog，发给B。
+4. 备库B拿到binlog后，写到本地文件，称为中转日志（relay log）。
+5. sql_thread 读取中转日志，解析日志里面的命令，并执行。
+
+
+### binlog 的三种格式对比
+
+binlog有三种格式：statement、row、mixed
+
+当执行以下SQL语句后，不同的binlog日志格式会有不同的记录内容：
+
+    mysql> delete from t /*comment*/  where a>=4 and t_modified<='2018-11-10' limit 1;
+
+对于statement格式的binlog，可以通过以下语句查看记录：
+
+    mysql> show binlog events in 'master.000001';
+
+![](https://img-blog.csdnimg.cn/20190328203028112.png)
+
+可以看到statement格式的binlog会记录完整执行的SQL语句。但是这会可能在某些情况下出现主备数据不一致的情况，上述执行的SQL语句中两个判断条件，并且还有一个limit 1 的限制，如果主库delete语句使用的是索引a，备库delete语句使用的是索引t_modified，就可能两个库删除的不是同一条记录，从而造成数据不一致的情况。
+
+通过 show warnings;  可以看到是有告警信息的。
+
+对于row格式的binlog存储内容：
+
+![](https://img-blog.csdnimg.cn/20190328203140716.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
+
+使用 mysqlbinlog 命令来解析：
+
+    mysqlbinlog  -vv data/master.000001 --start-position=8900;
+
+![](https://img-blog.csdnimg.cn/20190328203211615.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
+
+可以看到，当 binlog_format 使用的是 row 格式的时候，binlog里面记录了真实删除行的主键id，这样binlog传到备库去执行的时候，肯定会删除 id=4的行，就不会出现主备删除不同行的问题了。
+
+
+### 为什么会有 mixed 格式的binlog？
+
+mixed格式指的是statement 和 row 格式同时存在。考虑到statement格式可能会导致主备不一致，所以要使用 row 格式。但是row 格式又太占空间了，而且还消耗 IO 资源，影响执行速度。因此就有了 mixed 格式，当mysql认为这条 SQL 语句可能引起主备不一致时，就用 row 格式，否则就用 statement 格式。
+
+因此，线上的MySQL设置的binlog格式至少应该是 mixed，现在越来越多的场景要求把格式设置成row，这么做的一个直接的好处就是恢复数据。
+
+用 binlog 来恢复数据的标准做法是，用 mysqlbinlog 工具解析出来，然后把解析结果整个发给 MySQL 执行。类似下面的命令：
+
+
+    mysqlbinlog master.000001  --start-position=2738 --stop-position=2973 | mysql -h127.0.0.1 -P13000 -u$user -p$pwd;
+
+
+### 循环复制问题
+
+双M结构：
+
+![](https://img-blog.csdnimg.cn/20190328203358656.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
+
+双 M 结构，即：节点A和B之间总是互为主备关系。这样在切换的时候就不用再修改主备关系。
+
+但是有一个问题需要解决，就是节点A上更新来一条语句，然后把生成的 binlog 发给节点 B，节点B执行完这条更新语句后也会生成binlog。如果节点A同时是B的备库，相当于又把节点 B 新生成的 binlog 拿过来执行来一次，然后节点 A 和 B间，会不断地循环执行这个跟新语句，也就是循环复制了。
+
+MySQL在binlog 中记录了这个命令第一次执行时所在实例的 server id。因此，用下面的逻辑来解决循环复制的问题：
+
+1. 规定两个库的 server id 必须不同，如果相同，则它们之间不能设定为主备关系；
+2. 一个备库接到 binlog 并在重放的过程中，生成与原 binlog 的 server id 相同的新的 binlog;
+3. 每个库在收到从自己的主库发过来的日志后，先判断server id，如果跟自己的相同，表示这个日志是自己生成的，就直接丢弃这个日志。
+
 
 
 
