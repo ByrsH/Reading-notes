@@ -469,6 +469,67 @@ synchronized如果申请不到资源就会进入阻塞状态，同时线程已�
 破坏这个条件，需要对资源进行排序，然后按序申请资源。
 
 
+## 06 | 用“等待-通知”机制优化循环等待
+
+相比于循环等待，更好的方案是：如果线程要求的条件不满足，则阻塞自己，进入等待状态；当线程要求的条件满足后，通知等待的线程重新执行。其中，使用线程阻塞的方式就能够避免循环等待消耗CPU的问题。
+
+
+### 完美的就医流程
+
+完整的等待-通知机制：线程首先获取互斥锁，当线程要求的条件不满足时，释放互斥锁，进入等待状态；当要求的条件满足时，通知等待的线程，重新获取互斥锁。
+
+
+### 用 synchronized 实现等待-通知机制
+
+等待队列和互斥锁是一对一的关系，每个互斥锁都有自己的等待队列。
+
+![](https://img-blog.csdnimg.cn/20190402212646641.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
+
+可以通过Java对象的 notify() 和 notifyAll() 方法通知等待的线程。当条件满足时调用 notify()，会通知等待队列（互斥锁的等待队列）中的线程，告诉它条件曾经满足过。
+
+![](https://img-blog.csdnimg.cn/20190402212723889.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
+
+之所以是曾经满足过，是因为 notify() 只能保证在通知时间点，条件是满足的。而被通知线程的执行时间点和通知时间点基本上不会重合，所以当线程执行时，很可能条件已经不满足了。还有一点需要注意，被通知的线程要想重新执行，仍然需要获取到互斥锁，因为在调用 wait() 时互斥锁已经释放。
+
+wait()、notify()、notifyAll() 三个方法能够被调用的前提是已经获取了相应的互斥锁，所以会发现它们都是在 synchronized{} 内部被调用。如果在外部调用 target.wait() 的话，jvm会抛出一个运行时异常: java.lang.IllegalMonitorStateException。
+
+
+### 一个更好的资源分配器
+
+    class Allocator {
+  	  private List<Object> als;
+  	  // 一次性申请所有资源
+      synchronized void apply(
+        Object from, Object to){
+        // 经典写法
+        while(als.contains(from) ||
+             als.contains(to)){
+      	  try{
+            wait();
+      	  }catch(Exception e){
+          }   
+        }
+      als.add(from);
+      als.add(to);  
+      }
+      // 归还资源
+      synchronized void free(
+        Object from, Object to){
+        als.remove(from);
+        als.remove(to);
+        notifyAll();
+      }
+    }
+
+
+### 尽量使用 notifyAll()
+
+notify() 是会随机地通知等待队列中的一个线程，而 notifyAll() 会通知等待队列中的所有线程。通常情况下尽量使用 notifyAll()， 因为使用notify() 有可能导致某些线程一直通知不到处于等待状态。
+
+
+### 总结
+
+等待-通知机制是一种非常普遍的线程间协作的方式。Java语言内置的 synchronized 配合 wait()、notify()、notifyAll() 这三个方法可以快速实现这种机制。这种实现背后的理论模型其实是管程。
 
 
 
