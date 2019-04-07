@@ -442,7 +442,64 @@ MySQL在binlog 中记录了这个命令第一次执行时所在实例的 server 
 3. 每个库在收到从自己的主库发过来的日志后，先判断server id，如果跟自己的相同，表示这个日志是自己生成的，就直接丢弃这个日志。
 
 
+## 25 | MySQL是怎么保证高可用的？
 
+正常情况下，只要主库执行更新生成的所有binlog，都可以传到备库并被正确执行，备库就能达到跟主库一致的状态，这就是最终一致性。
+
+![](https://img-blog.csdnimg.cn/20190407153427810.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
+
+### 主备延迟
+
+所谓主备延迟，就是同一个事务，在备库执行完成的时间和主库执行完成的时间之间的差值。
+
+在备库上执行  show slave status 命令，它的返回结果里面会显示 second_behind_master，用于表示当前主备延迟了多少秒。
+
+如果主备库时间不一致，并不会导致主备延迟的值不准。因为备库在连接主库后会通过 SELECT UNIX_TIMESTAMP() 函数来获得当前主库的系统时间。在计算second_behind_master 时会扣除掉这个值。
+
+网络正常时，主库传输binlog到备库的网络耗时是很少的，主备延迟最直接的表现是，备库消费中转日志（relay log）的速度，比主库生成 binlog 的速度要慢。
+
+
+### 主备延迟的来源
+
+第一种是在有些部署条件下，备库所在机器的性能要比主库所在的机器性能差。
+
+第二种是备库的压力大。在主备选用相同规格的机器后，备库可能会用于提供一些读能力。当备库上的查询消耗了大量的 CPU 资源，影响了同步速度，就会造成主备延迟。通常的解决方案如下：
+
+1. 一主多从。除了备库外，可以多接几个从库，让这些从库来分担读的压力。备库和从库概念上差不多，把在 HA过程中被选成新主库的，称为备库。这种方案通常会被采用，从库可以用来做备份。
+2. 通过binlog输出到外部系统，比如 Hadoop 这类系统，让外部系统提供统计类查询的能力。
+
+第三种是大事物。大事物的执行时间过长，主库上必须等事物执行完成才会写入 binlog，再传给备库。比如一次性地用 delete 语句删除太多数据。还有大表的DDL。
+
+第四种是备库的并行复制能力。
+
+
+### 可靠性优先策略
+
+![](https://img-blog.csdnimg.cn/20190407153651540.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
+
+图中的SBM是参数 second_behind_master 参数的简写。
+
+可靠性优先策略中是有不可用状态的，判断SBM=0的过程中，主库和备库都是只读状态，当SBM=0时才把B设置为可写状态。这端时间内数据库是不可以写数据的。
+
+
+### 可用性优先策略
+
+如果强行切换，不判断 SBM 是否等于0，直接把连接切到备库B，并且让备库可以读写，那么系统几乎就没有不可用时间了。但是这样切换的代价就是可能出现数据不一致的情况。
+
+![](https://img-blog.csdnimg.cn/20190407153732550.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
+
+![](https://img-blog.csdnimg.cn/20190407153757901.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
+
+从上面的分析中，可以得出一些结论：
+
+1. 使用 row 格式的binlog时，数据不一致的问题更容易被发现。
+2. 主备切换的可用性优先策略会导致数据不一致。因此大多数情况下，建议使用可靠性优先策略。
+
+可靠性优先策略下，异常切换的效果。主备延迟30分钟，主库A掉电，HA系统要切换B作为主库。
+
+![](https://img-blog.csdnimg.cn/20190407153928370.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
+
+在满足数据可靠性的前提下，MySQL高可用系统的可用性，是依赖于主备延迟的。延迟的时间越小，在主库故障的时候，服务恢复需要的时间就越短，可用性就越高。
 
 
 
