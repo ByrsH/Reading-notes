@@ -502,6 +502,123 @@ MySQL在binlog 中记录了这个命令第一次执行时所在实例的 server 
 在满足数据可靠性的前提下，MySQL高可用系统的可用性，是依赖于主备延迟的。延迟的时间越小，在主库故障的时候，服务恢复需要的时间就越短，可用性就越高。
 
 
+## 26 | 备库为什么会延迟好几个小时？
+
+![](https://img-blog.csdnimg.cn/20190414154751308.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
+
+第一个黑色箭头表示客户端写入主库，第二个黑色箭头表示备库上 sql_thread 执行中转日志（relay log）。如果客户端写入主库的并发度远大于备库执行中转日志的并发度，那么将会造成严重地主备延迟。
+
+![](https://img-blog.csdnimg.cn/20190414154824692.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
+
+coordinator 就是原来的 sql_thread，不过现在它不再是直接更新数据了，只负责读取中转日志和分发事务。真正的日志更新变成了worker线程。worker线程的个数是由参数 slave_parallel_workers 决定的。根据经验，值设置为 8~16 之间最好（32核物理机）。
+
+coordinator在分发的时候，需要满足以下两个基本要求：
+
+1. 不能造成更新覆盖。这就要求更新同一行的两个事务，必须被分发到同一个worker中。
+2. 同一个事务不能被拆开，必须放到同一个worker中。
+
+### MySQL 5.5 版本的并行复制策略
+
+MySQL5.5版本是不支持并行复制的，备库只能单线程复制。 林实现了两种并行策略：按表分发策略和按行分发策略。
+
+
+#### 按表分发策略
+
+按表分发事务的基本思路是，如果两个事务更新不同的表，它们就可以并行。因为数据是存储在两个不同的表里，所以按表分发，可以保证两个 worker 不会更新同一行。如果有跨表的事务，还是要放在一起考虑的。
+
+![](https://img-blog.csdnimg.cn/20190414154941955.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
+
+
+假设事务T要修改表 t1 和 t3，事务T的分配流程：
+
+1. 由于事务 T 中涉及修改表 t1，而worker1队列中有事务在修改表 t1，事务T和队列中的某个事务要修改同一个表的数据，这种情况我们说事务T和worker_1是冲突的；
+2. 按照这个逻辑，顺序判断事务 T 和每个 worker 队列的冲突关系，会发现事务 T 跟 worker_2 也冲突；
+3. 当事务 T 跟多于一个 worker 冲突时，coordinator线程就会进入等待；
+4. 每个 worker 继续执行，同时修改 hash_table。假设 worker_2 中涉及到修改表 t3 的事务执行完成，就会从 hash_table_2 中把 db1.t3 这一项去掉；
+5. 这样 coordinator 会发现跟事务 T 冲突的 worker 只有 worker_1 ，因此就把它分配给 worker_1；
+6. coordinator 继续读下一个中转日志，继续分配事务。
+
+事务在分发时，跟 worker 的冲突关系：
+
+1. 如果跟所有 worker 都不冲突，coordinator 线程就会把这个事务分配给最空闲的worker；
+2. 如果只跟一个 worker 冲突，coordinator 线程就会把事务分配个这个存在冲突关系的 worker；
+3. 如果跟多于一个的worker冲突，coordinator 线程就进入等待状态，直到和这个事务存在冲突关系的worker只剩下1个；
+
+
+#### 按行分发策略
+
+解决热点表的并行复制问题，就需要一个按行并行复制的方案。按行复制的核心思路是：如果两个事务没有更新相同的行，它们在备库上可以同时执行。显然，这个模式要求 binlog 格式必须是 row。
+
+这时候，我们判断一个事务 T 和 worker 是否冲突，用的就不是“修改同一个表”，而是修改同一行。
+
+基于行的策略，事务 hash 表中还需要考虑唯一键。即 key 应该是 “库名 + 表名 + 索引 a + a 的值”。可见相比于按表并行分发策略，按行并行策略在决定线程分发的时候，需要消耗更多的计算资源。
+
+两个方案都有一些约束条件：
+
+1. 要能够从 binlog 里面解析出表名、主键值和唯一索引的值。也就是说，主库的 binlog 格式必须是 row；
+2. 表必须有主键；
+3. 不能有外键。
+
+虽然按行分发策略的并行度更高。不过，如果是要操作很多行的大事务的话，按行分发的策略有两个问题：
+
+1. 耗费内存。hash表存储更多的数据
+2. 耗费 CPU。解析 binlog，计算 hash 值。
+
+可以通过设置阈值，单个事务如果超过设置的阈值，就暂时退化为单线程模式。
+
+
+### MySQL 5.6 版本的并行复制策略
+
+官方5.6版本支持了并行复制，只是支持的粒度是按库并行。
+
+### MariaDB 的并行复制策略
+
+MariaDB 策略，目标是“模拟主库的并行模式”。但它并没有实现“真正的模拟主库并发度”这个目标。
+
+MariaDB 的并行复制策略利用了 redo log 组提交优化的特性：
+
+1. 能够在同一组里提交的事务，一定不会修改同一行；
+2. 主库上可以并行执行的事务，备库上也一定可以并行执行。
+
+具体实现： 
+
+1. 在一组里面一起提交的事务，有一个相同的commit_id，下一组就是 commit_id + 1;
+2. commit_id 直接写到 binlog 里面；
+3. 传到备库应用的时候，相同 commit_id 的事务分发到多个 worker 执行；
+4. 这一组全部执行完成后，coordinator 再去取下一批。
+
+![](https://img-blog.csdnimg.cn/20190414155333438.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
+
+![](https://img-blog.csdnimg.cn/20190414155434462.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
+
+可以看到，在主库执行的时候，多组事务是并行执行的，但在从库上同时只能一组事务执行，这样系统的吞吐量就不够。这个方案很容易被大事务拖后腿，如果 trx2 是一个超大事务，那么在 trx1 和 trx3执行完后，就只有一个worker线程在工作了，是对资源的浪费。
+
+
+### MySQL 5.7 的并行复制策略
+
+参数 slave-parallel-type 来控制并行复制策略：
+
+1. 配置为 DATABASE, 表示使用 MySQL 5.6 版本的库并行策略；
+2. 配置为 LOGICAL_CLOCK，表示使用优化过的类似 MariaDB 的策略。
+
+
+MySQL 5.7 并行复制策略的思想是：
+
+1. 同时处于 prepare 状态的事务，在备库执行时是可以并行的；
+2. 处于 prepare 状态的事务，与处于 commit 状态的事务之间，在备库执行时也是可以并行的。
+
+用于控制binlog 从 write 到 fsync 时间的参数，既可以减少 binlog 的写盘次数，也可以制造更多的“同时处于 prepare 阶段的事务”，从而提升备库复制并发度的目的。
+
+
+### MySQL 5.7.22 的并行复制策略
+
+新增了一个新的并行复制策略，基于 WRITESET 的并行复制。由参数 binlog-transaction-dependency-tracking，用来控制是否启用这个新策略。可取值：
+
+1. COMMIT_ORDER，表示就是前面介绍的，根据同时进入 prepare 和 commit 来判断是否可以并行的策略；
+2. WRITESET，表示的是对于事务涉及更新的每一行，计算出这一行的hash值，组成 writeset 集合。如果两个事务没有操作相同的行，也就是 writeset 没有交集，就可以并行；
+3. WRITESET_SESSION，在 WRITESET 的基础上多了一个约束，在主库上同一个线程先后执行的事务，在备库也要保证相同的执行顺序。
+
+
 
 
 
