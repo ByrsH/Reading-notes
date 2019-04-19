@@ -619,7 +619,100 @@ MySQL 5.7 并行复制策略的思想是：
 3. WRITESET_SESSION，在 WRITESET 的基础上多了一个约束，在主库上同一个线程先后执行的事务，在备库也要保证相同的执行顺序。
 
 
+## 27 | 主库出问题了，从库怎么办？
 
+一主多从结构：
+
+![](https://img-blog.csdnimg.cn/20190419225833201.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
+
+
+图中虚线箭头表示的是主备关系，也就是 A 和 A' 互为主备关系。从库 B、C、D 指向的是主库A。一主多从的设置，一般用于读写分离，主库负责所有的写和一部分读，其他的读请求由从库分担。
+
+在一主多从架构下，主备切换问题：
+
+![](https://img-blog.csdnimg.cn/20190419225902947.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
+
+相比于一主一备的切换流程，一主多从在切换完成后，A'会成为新的主库，从库 B、C、D 也要改连接到 A'。从而主备切换的复杂性也相应增加了。
+
+
+### 基于位点的主备切换
+
+我们把节点B设置成A'的从库的时候，需要执行一条 change master 命令：
+
+    
+    CHANGE MASTER TO
+    MASTER_HOST=$host_name
+    MASTER_PORT=$port
+    MASTER_USER=$user_name
+    MASTER_PASSWORD=$password
+    MASTER_LOG_FILE=$master_log_name
+    MASTER_LOG_POS=$master_log_pos  
+
+前四个参数分别是主库的 IP、端口、用户名和密码。最后两个参数是要从主库的 master_log_name 文件的 master_log_pos 这个位置的日志继续同步。这个位置就是我们所说的同步位点。
+
+同步位点的获取是不精确的，考虑到切换过程中不能丢失数据，所以找位点的时候，总是要找一个“稍微往前”的，再通过判断跳过哪些在从库B上已经执行的事务。
+
+一种取同步位点的方法：
+
+1. 等待新主库 A' 把中转日志（relay log）全部同步完成；
+2. 在 A' 上执行 show master status 命令，得到当前 A' 上最新的 File 和 Position；
+3. 取原主库 A 故障的时刻 T；
+4. 用 mysqlbinlog 工具解析 A' 的 file, 得到 T时刻的位点。
+
+    mysqlbinlog File --stop-datetime=T --start-datetime=T
+
+![](https://img-blog.csdnimg.cn/2019041922595591.png)
+
+end_log_pos 后面的值“123”可以把它作为 $master_log_pos。当然这个值是不精确的，因为如果主库在刚传完insert语句的binlog时掉电，那么从库 B和备库 A' 都已执行过该insert语句，在从库执行 change master 命令时，就会把insert 的binlog同步到从库B执行，这时就会出错（主键重复），然后停止同步。
+
+通常情况下，在切换任务的时候，要先主动跳过这些错误，有两种常用的方法：
+
+1、主动跳过一个事务。每次碰到错误时，就执行一次跳过命令。
+
+
+    set global sql_slave_skip_counter=1;
+    start slave;
+
+2、通过设置 slave_skip_errors 参数，直接设置跳过指定的错误。这种设置是在主备切换时，当切换完成，稳定执行一定时间后，还需把这个参数设置为空。
+
+例如设置 slave_skip_errors 为 “1032,1062”。
+
+
+### GTID
+
+通过上述方式来实现主备切换，操作都很复杂，而且容易出错。MySQL5.6版本引入了GTID，彻底解决了这个困难。
+
+Global Transaction identifier，也就是全局事务 ID，是一个事务在提交时生成的。格式： GTID=server_uuid:gno，server_uuid 是一个实例第一次启动时生成的，是一个全局唯一的值；gno 是一个整数，初始值为1，每次提交事务的时候分配给这个事务，并加1。
+
+官方文档给的定义是： GTID=source_id:transaction_id
+
+在启动MySQL实例时，通过加上参数 gtid_mode=on 和 enforce_gtid_consistency=on 就可以启动GTID模式了。在GTID模式下，每一个事务都与一个GTID一一对应。GTID的两种生成方式，由session变量gtid_next的值决定：
+
+1. 如果 gtid_next=automatic，代表使用默认值。这时，MySQL就会把 server_uuid:gno 分配给这个事务
+	1. 记录binlog的时候，先记录一行 SET @@SESSION.GTID_NEXT='server_uuid:gno';
+	2. 把这个GTID加入到本实例的 GTID 集合。
+2. 如果 gtid_next 是一个指定的 GTID 值，那么就有两种可能：
+	1. 如果指定值已经在 GTID 集合中，接下来执行的这个事务直接被系统忽略，不执行该事务；
+	2. 如果指定值没有在 GTID 集合中，就将该值分配给这个事务。系统不需要给这个事务生成新的 GTID， 因此gno 也不用加1。
+
+这样，每个 MySQL 实例都维护了一个GTID 集合，用来对应“这个实例执行过的所有事务”。
+
+
+### 基于 GTID 的主备切换
+
+在 GTID 模式下，备库 B 要设置为新主库 A' 的从库的语法如下：
+
+    
+    CHANGE MASTER TO
+    MASTER_HOST=$host_name
+    MASTER_PORT=$port
+    MASTER_USER=$user_name
+    MASTER_PASSWORD=$password
+    master_auto_position=1
+
+master_auto_position=1 表示这个主备关系使用的是 GTID 协议。
+
+在主备切换时，从库会把自己的 GTID 集合发送个 新主库 A' ，A' 会用自己的 GTID 集合与从库比较，算出差集。如果 A' 不包含差集中的所需要的 binlog 事务，那么直接返回错误；如果包含，则找出差集只中的第一个事务发给从库，之后就从这个事务开始，往后读文件，顺序取 binlog 发送给从库。
 
 
 
