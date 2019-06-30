@@ -715,15 +715,142 @@ master_auto_position=1 表示这个主备关系使用的是 GTID 协议。
 在主备切换时，从库会把自己的 GTID 集合发送个 新主库 A' ，A' 会用自己的 GTID 集合与从库比较，算出差集。如果 A' 不包含差集中的所需要的 binlog 事务，那么直接返回错误；如果包含，则找出差集只中的第一个事务发给从库，之后就从这个事务开始，往后读文件，顺序取 binlog 发送给从库。
 
 
+## 28 | 读写分离有哪些坑？
+
+![在这里插入图片描述](https://img-blog.csdnimg.cn/2019063019181575.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
+
+读写分离的主要目标就是分摊主库的压力。图1 中的结构是客户端（client）主动做负载均衡，这种模式下一般会把数据库的连接信息放在客户端的连接层。由客户端来选择数据库进行查询。
+
+还有一种架构是，在MySQL和客户端之间有一个中间代理层 proxy，客户端只连接 Proxy，由Proxy根据请求类型和上下文决定请求的分发路由。
+
+![在这里插入图片描述](https://img-blog.csdnimg.cn/20190630191851624.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
 
 
+两种架构的特点：
+
+1. 客户端直连，因为少了一层Proxy转发，索引查询性能稍微好一点，并且整体架构简单，排查问题更方便。但是这种方案需要了解后端部署细节，所以在出现主备切换、库迁移等操作的时候，客户端会感知到，并且要调整数据库连接信息。为了更方便的管理，一般会使用管理后端的组件，例如zookeeper。
+2. 待Proxy 的架构，对客户端比较友好。客户端不需要关注后端细节，连接维护、后端信息维护等工作，都是由Proxy完成。使用这种架构会增加系统的复杂度，因此对团队的要求会更高。
+
+无论使用哪种架构，都会碰到由于主从可能存在延迟，客户端执行完一个更新事务后马上发起查询，如果查询选择的是从库的话，就有可能读到刚刚的事务更新之前的状态。
+
+这种“在从库上会读到系统的一个过期状态”的现象，我们暂且称之为“过期读”。
+
+处理方案：
+
+- 强制走主库方案；
+- sleep 方案；
+- 判断主备无延迟方案；
+- 配合 semi-sync 方案；
+- 等主库位点方案；
+- 等 GTID 方案。
+
+### 强制走主库方案
+
+强制走主库方案就是，将查询请求做分类：
+
+1. 对于必须要拿到最新结果的请求，强制将其发到主库上。
+2. 对于可以读到旧数据的请求，才将其发到从库上。
+
+### Sleep 方案
+
+主库更新后，读从库之前先 sleep 一下。
+
+这种方式看起来不靠谱，存在的问题：
+
+1. 如果这个查询请求本来 0.5 秒就可以在从库上拿到正确结果，也会等 n 秒。
+2. 如果延迟超过 n 秒，还是会出现过期读。
 
 
+### 判断主备无延迟方案
+
+在确保主备无延迟的情况下，才进行从库请求。
+
+![在这里插入图片描述](https://img-blog.csdnimg.cn/20190630192218116.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
+
+**第一种**确保主备无延迟的方法是，每次从库执行查询请求前，先判断 seconds_behind_master 是否已经等于0（表示主备无延迟）。直到参数等于 0  时才能执行查询请求。
+
+**第二种**方法，对比位点确保主备无延迟：
+
+- Master_Log_File 和 Read_Master_Log_Pos，表示的是读到的主库的最新位点；
+- Relay_Masert_Log_File 和 Exec_Master_Log_Pos，表示的是备库执行的最新位点。
 
 
+如果两组值对应相等，就表示接收到的日志已经同步完成。
+
+第三种方法，对比 GTID 集合确保主备无延迟：
+
+- Auto_Position=1，表示这对主备关系使用了 GTID 协议。
+- Retrieved_Gtid_Set，是备库收到的所有日志的 GTID 集合；
+- Executed_Gtid_set，是备库所有已执行完成的 GTID 集合。
 
 
+当两个集合相同时，表示备库接收到的日志都已同步完成。
 
+可见对比位点和对比 GTID 方法，都要比判断 second_behind_master 是否为 0 更准确。
+
+但是还没有达到精确的程度，因为发往备库的 binlog 是始终少于等于主库 binlog 内容的，即使从库 binlog 都执行完成，与主库的状态还是可能不同步的，就会出现过期读。
+
+
+### 配合 semi-sync
+
+半同步复制：semi-sync replication
+
+1. 事务提交的时候，主库把 binlog 发给从库；
+2. 从库收到 binlog 后，发回给主库一个 ack，表示收到了；
+3. 主库收到这个 ack 后，才能给客户端返回 “事务完成”的确认。
+
+![在这里插入图片描述](https://img-blog.csdnimg.cn/20190630192438923.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
+
+
+semi-sycn 配合判断主备无延迟的方案，存在两个问题：
+
+1. 一主多从的时候，在某些从库执行查询请求会存在过期读的现象；
+2. 在持续延迟的情况下，可能出现过度等待的问题。
+
+### 等主库位点方案
+
+![在这里插入图片描述](https://img-blog.csdnimg.cn/20190630192527163.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
+
+执行逻辑：
+
+
+1. trx1 事务更新完成后，马上执行 show master status 得到当前主库执行到的 File 和Position；
+2. 选定一个从库执行查询语句；
+3. 在从库上执行 select master_pos_wait(File, Position, 1);
+4. 如果返回值是 >= 0 的正整数，则在这个从库执行查询语句；
+5. 否则，到主库执行查询语句。
+
+    select master_pos_wait(file, pos[, timeout]);
+
+表示从命令开始执行，到应用完 file 和 pos 表示的 binlog 位置，执行了多少事务。
+
+对于不予许过期读的要求，只有两个选择，一种是超时放弃，一种是转到主库查询。需要注意的是考虑到主库的压力，做好限流策略。
+
+
+### GTID 方案
+
+    select wait_for_executed_gtid_set(gtid_set, 1);
+
+命令的逻辑是：
+
+1. 等待，直到这个库执行的事务中包含传入的 gtid_set， 返回0；
+2. 超时返回 1。
+
+等 GTID 的执行逻辑：
+
+1. trx1 事务更新完成后，从返回包直接获取这个事务的 GTID， 记为 gtid1；
+2. 选定一个从库执行查询语句；
+3. 在从库上执行  select wait_for_executed_gtid_set(gtid_set, 1);
+4. 如果返回值是 0，则在这个从库执行查询语句；
+5. 否则，到主库执行查询语句。
+
+![在这里插入图片描述](https://img-blog.csdnimg.cn/20190630192737299.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
+
+
+通过设置参数 session_track_gtids = OWN_GTID ，让 MySQL 在执行事务后，返回包中带上 GTID。然后通过 API 接口 mysql_session_track_get_first 从返回包中解析 GTID 的值。
+
+
+### 小结
 
 
 
