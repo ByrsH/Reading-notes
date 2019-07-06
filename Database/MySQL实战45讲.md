@@ -853,6 +853,84 @@ semi-sycn 配合判断主备无延迟的方案，存在两个问题：
 ### 小结
 
 
+## 29 | 如何判断一个数据库是不是出问题了？
+
+### select 1 判断
+
+![在这里插入图片描述](https://img-blog.csdnimg.cn/20190706174650291.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
+
+select1成功返回，只能说明这个库的进程还在，并不能说明主库没有问题。
+
+innodb_thread_concurrency 参数设置并发线程上限，一旦并发线程数达到这个值， InnoDB 在接收到新请求的时候，就会进入等待状态，直到有线程退出。默认值为0，表示不限制并发线程数量。如果不限制，CPU核数有限，线程上下文切换成本高。一般建议设置为 64-128 之间。
+
+并发连接和并发查询是不同的概念。show processlist 的结果，指的是并发连接，达到几千个影响不大，多占些内存。“当前正在执行”的语句，才是并发查询，其占用CPU资源。
+
+线程在进入锁等待以后，并发线程的计数会减一，也就是等行锁（也包括间隙锁）的线程并不在 innodb_thread_concurrency 中。原因是，进入锁等待的线程并不吃CPU了，再有就是如果计数不减一，线程等待数到达上限值，整个系统就会堵住了。
+
+如果线程真正地在执行查询，比如上述的 select sleep(100) from t，还是要算进并发线程的计数的。
+
+
+### 查表判断
+
+可以通过在MySQL里面创建一张表，然后定期执行查询语句。这样就可以检测出由于并发线程过多导致数据库不可用的情况。
+
+但是，如果遇到磁盘空间满的时候，这种方法就变得不可用。更新事务时要写 binlog，而一旦 binlog 所在磁盘的空间占用率达到 100%， 那么所有的更新语句和事务提交的 commit 语句就都会被堵住。但是可以进行正常的读数据。
+
+
+### 更新判断
+
+常见的做法是放一个 timestamp 字段，用来表示最后一次执行检测的时间。
+
+节点可用性检测应该包含主库和备库。我们一般会把数据库 A 和 B 的主备关系设计为双 M 结构，所以在备库 B上执行的命令也要发回给主库 A。如果主库 A 和 备库 B 都用相同的更新命令，就可能出现行冲突，也就是可能会导致主备同步停止。所以更新的表就要有多行数据，id 对应每个数据库的 server_id 做主键。
+
+    mysql> CREATE TABLE `health_check` (
+      `id` int(11) NOT NULL,
+      `t_modified` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (`id`)
+    ) ENGINE=InnoDB;
+    
+    /* 检测命令 */
+    insert into mysql.health_check(id, t_modified) values (@@server_id, now()) on duplicate key update t_modified=now();
+
+MySQL 规定了主库和备库的 server_id 必须不同，这样就可以保证检测命令不会发生冲突。
+
+如果检测命令的id一样，两个语句同时执行，那么在主库和备库上就都是“insert行为”，写到binlog里面就都是Write rows event，这个冲突就会导致主备同步停止。
+
+但是依然存在一些问题，当 IO 利用率 100%时，表示系统的 IO 是在工作的，每个请求都有机会获得 IO 资源，执行任务。检测执行语句需要的资源很少，所以可能在拿到 IO 资源的时候就可以提交成功，并且在未到达超时时间时就返回给检测系统，那么就会得出“系统正常”的结论。但其实业务系统上正常的 SQL语句已经执行的很慢了。
+
+上述所说的所有方法，都是基于外部检测的。存在两个问题：一是检测方式并不能真正完全的反应系统当前的状况，二是定时轮询检测有时间间隔，如不能及时发现，可能导致切换慢的问题。
+
+
+### 内部统计
+
+可以通过MySQL 统计的 IO 请求时间，来判断数据库是否出问题。
+
+可以通过下面语句，查看各类 IO 操作统计值：
+
+
+    select * from performance_schema.file_summary_by_event_name where event_name = 'wait/io/file/innodb/innodb_log_file';
+
+
+![在这里插入图片描述](https://img-blog.csdnimg.cn/20190706174901257.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
+
+
+从上到下分别统计的是：所有 IO 类型、读操作、写操作、其他类型数据。
+
+performance_schema 统计是有性能损耗的，因此只需打开需要的监控即可。例如 redo log：
+
+
+    mysql> update setup_instruments set ENABLED='YES', Timed='YES' where name like '%wait/io/file/innodb/innodb_log_file%';
+
+检测语句，200 ms 为异常：
+
+    mysql> select event_name,MAX_TIMER_WAIT  FROM performance_schema.file_summary_by_event_name where event_name in ('wait/io/file/innodb/innodb_log_file','wait/io/file/sql/binlog') and MAX_TIMER_WAIT>200*1000000000;
+
+清空语句：
+
+    mysql> truncate table performance_schema.file_summary_by_event_name;
+
+
+### 小结
 
 
 
