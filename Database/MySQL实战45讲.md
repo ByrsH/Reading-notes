@@ -1295,6 +1295,91 @@ MySQL也并没有使用 Simple Nested-Loop Join 算法，而是使用了 “Bloc
 更准确的说，在决定哪个表做驱动表的时候，应该是两个表按照各自的条件过滤，过滤完成之后，计算参与 join 的各个字段的总数据量，数据量小的那个表，就是“小表”，应该作为驱动表。
 
 
+## 35 | join语句怎么优化？Multi-Range Read 优化
+
+### MRR 优化的主要目的是尽量使用顺序读盘。
+
+回表是一行行搜索主键索引的，因为大多数的数据都是按照主键递增顺序插入得到的，所以可以认为，如果按照主键的顺序查询的话，对磁盘的读比较接近顺序读，能够提升读性能。
+
+MRR 优化后的执行流程：
+
+1. 根据索引 a，定位到满足条件的记录，将 id 值放入 read_rnd_buffer 中；
+2. 将 read_rnd_buffer 中的 id 进行递增排序；
+3. 排序后的 id 数组，一次到主键 id 索引中查找记录，并作为结果返回。
+
+read_rnd_buffer 的大小是由 read_rnd_buffer_size 参数控制。如果步骤 1 中 read_rnd_buffer 放满了，那么就先执行 2 、3 ，清空 read_rnd_buffer。之后继续找索引 a 的下一个记录，循环此步骤。
+
+如果想要稳定地使用 MRR 优化的话，需要设置 set optimizer_switch="mrr_cost_based=off"。现在的优化器策略更倾向于不使用 MRR。
+
+需要注意的是，由于我们在 read_rnd_buffer 中按照 id 进行了排序，所以最后得到的结果集也是按照 id 递增的顺序。
+
+MRR 能够提升性能的核心在于，查询语句在 a 索引上做范围查询，这样就可以排序主键 id，然后顺序读。
+
+
+### Batched Key Access
+
+MySQL 5.6 版本引入 Batched Key Access （BKA）算法。其实就是对 NLJ 算法的优化。
+
+NLJ 算法是从驱动表 t1 中，一行行取出 a 的值，再到被驱动表 t2 去做 join。对于 t2 表来说每次都是匹配一个值，这时 MRR 优化是用不上的。
+
+NLJ 算法是没有用到 join_buffer的。要想一次性多传些值给表 t2，使用到 MRR 优化，可以通过先把从表 t1 取出来的数据放入 join_buffer，然后再传给表 t2，这就是 BKA 算法。
+
+![在这里插入图片描述](https://img-blog.csdnimg.cn/20190721192011130.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
+
+
+如果要使用 BKA 优化算法的话，需要设置：
+
+    set optimizer_switch='mrr=on,mrr_cost_based=off,batched_key_access=on';
+
+
+### BNL 算法的性能问题
+
+在使用 BNL 算法时，如果被驱动表是一个大的冷数据表，除了会导致 IO 压力大以外，还会影响 Buffer Pool 的命中率。
+
+多次扫描一个冷表，这个语句的执行时间超过 1 秒时，就会把冷表的数据页移到 LRU 链表头部。这种情况是对应与冷表数据量小于 Buffer Pool 的 3/8 时。如果冷表数据很大，old区域的数据页很有可能在 1 秒之内就被淘汰了。这样就不会进入young 区域，导致 young 区域的数据页没有被合理地淘汰。
+
+大表 join 操作虽然对 IO 有影响，但是在语句执行结束后，对 IO 的影响也就结束了。而对于 Buffer Pool 的影响就是持续性的，需要依靠后续的查询请求慢慢恢复内存命中率。
+
+为了减少这种影响，可以考虑增多 join_buffer_size 的值，减少对被驱动表的扫描次数。
+
+BNL 算法对系统的影响主要包括三个方面：
+
+1. 可能会多次扫描被驱动表，占用磁盘 IO 资源；
+2. 判断 join 条件需要执行 M*N 次对比，如果是大表就会占用非常多的 CPU 资源；
+3. 可能会导致 Buffer  Pool 的热数据被淘汰，影响内存命中率。
+
+优化常见的做法是在被驱动表上给 join 字段加索引，把 BNL 算法转成 BKA 算法。
+
+
+### BNL 转 BKA
+
+一些情况下，可以直接在被驱动表上建索引，这时可以直接转成 BKA 算法。但是有些时候不适合建索引，比如这个 join SQL语句是低频执行，而且经过 where 条件过滤后数据量很少，如果这时加索引的话就很浪费。如果不加索引，就要比对很多次，占用 CPU 资源。可以同过使用临时表来解决：
+
+1. 把表 t2 中满足条件的数据放在临时表 tmp_t 中；
+2. 为了让 join 使用 BKA 算法，给临时表 tmp_t 的字段 b 加上索引；
+3. 让表 t1 和 tmp_t 做 join 操作。
+
+    create temporary table temp_t(id int primary key, a int, b int, index(b))engine=innodb;
+    insert into temp_t select * from t2 where b>=1 and b<=2000;
+    select * from t1 join temp_t on (t1.b=temp_t.b);
+
+
+### 扩展 -hash join
+
+如果 join_buffer 里面维护的不是一个无序的数组，而是一个哈希表的话，那么就不是 10 亿次判断，而是 100 万次hash 查找，这样速度就快很多。但目前MySQL还不支持。
+
+可以把优化放在业务端实现。比如把表 t1 的数据存入一个hash 结构里，再取出表 t2 数据，然后去 hash 结构中比较。
+
+
+### 小结
+
+优化方法中：
+
+1. BKA 优化是 MySQL 已经内置支持的，建议默认使用；
+2. BNL 算法效率低，建议尽量转成 BKA 算法。优化的方向是给驱动表的关联字段加上索引；
+3. 基于临时表的改进方案，对于能够提前过滤出小数据的 join 语句来说，效果还是很好的；
+4. MySQL 目前的版本还不支持 hash join， 但你可以配合应用端自己模拟出来，理论上效果好于临时表方案。
+
 
 
 
