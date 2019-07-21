@@ -1143,7 +1143,156 @@ MySQL客户处默认采用第一种方式，如果加上 -quick 参数，就会�
 3. 不会把执行命令记录到本地的命令历史文件。
 
 
+## 33 | 我查这么多数据，会不会把数据库内存打爆？
 
+### 全表扫描对 server 层的影响
+
+服务端取数据和发数据的流程是：
+
+1. 获取一行，写到 net_buffer 中。这块内存的大小是由参数 net_buffer_length 定义的，默认是 16k；
+2. 重复获取行，直到 net_buffer 写满，调用网络接口发出去。
+3. 如果发生成功，就清空 net_buffer，然后继续取下一行，并写入 net_buffer。
+4. 如果发生函数返回 EAGAIN 或 WSAEWOULDBLOCK ，就表示本地网络栈（socket send buffer）写满了，进入等待。直到网络栈重新可写，再继续发送。
+
+![在这里插入图片描述](https://img-blog.csdnimg.cn/20190721151721490.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
+
+
+从流程中可以看到：
+
+1. 一个查询在发送过程中，占用的 MySQL 内部的内存最大就是 net_buffer_length 这么大，并不会达到 200G；
+2. socket send buffer 也不可能达到 200G （默认定义 /proc/sys/net/core/wmem_default），如果 socket send buffer 被写满，就会暂停读数据的流程。
+
+MySQL 是“边读边发的”。如果客户端接收得慢，会导致 MySQL 服务端由于结果发不出去，这个事务的执行时间变长。
+
+如果客户端不去读 socket receive buffer 中的内容，服务端线程的状态就会是 “Sending to client”，表示服务器端的网络栈写满了。
+
+对于正常的线上业务来说，如果一个查询的返回结果不会很多的话，建议使用 mysql_store_result 这个接口，也就是直接把查询结果保存在本地内存。如果执行了大查询，导致客户端占用很多内存，就需要使用 mysql_use_result 接口了，也就是不缓存，读一个处理一个。
+
+一个查询语句的状态变化过程：
+
+- MySQL 查询语句进入执行阶段后，首先把状态设置成 “Sending data”；
+- 然后，发送执行结果的列相关的信息（meta data）给客户端；
+- 再继续执行语句的流程；
+- 执行完成后，把状态设置成空字符串。
+
+仅当一个线程处于“等待客户端接收结果”的状态，才会显示“Sending to client”；而如果显示成“Sending data”，它的意思只是“正在执行”。
+
+查询的结果是分段发给客户端的，因此扫描全表，查询返回大量的数据，并不会把内存打爆。
+
+
+### 全表扫描对 InnoDB 的影响
+
+内存的数据页是在 Buffer Pool（BP）中管理的，在 WAL里 Buffer Pool 不仅起到了加速更新的作用，还起到了加速查询的作用。
+
+![在这里插入图片描述](https://img-blog.csdnimg.cn/2019072115213699.png)
+
+InnoDB 内存管理用的是最近最少使用（LRU）算法，算法的核心就是淘汰最久未使用的数据。
+
+![在这里插入图片描述](https://img-blog.csdnimg.cn/20190721152202664.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
+
+为了防止业务查询出大量不经常使用的数据，把 Buffer Pool 的空间之前的数据全部淘汰，存储这些未经常使用的数据，导致 Buffer Pool 命中率急剧下降，磁盘压力增加，SQL语句响应变慢，InnoDB对 LRU 算法做了改进。
+
+![在这里插入图片描述](https://img-blog.csdnimg.cn/20190721152239216.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
+
+在 InnoDB 实现上，按照 5:3 的比例把整个 LRU 链表分成了 young 区域和 old 区域。图中 LRU_old 指向的就是 old 区域的第一个位置，是整个链表的 5/8 处。靠近链表头部的 5/8 是 young 区，靠近链表尾部的 3/8 是 old 区域。
+
+改进后 LRU 算法执行流程：
+
+1. 图7中状态1，要访问数据页 P3，由于 P3 在 young 区，因此和优化前的算法一样，将其移动到链表头部，变成状态 2；
+2. 之后访问一个新的不存在与当前链表的数据页，依然淘汰链表尾部的数据页 Pm，但是新插入的数据页 Px ，是放在 LRU_old 处。
+3. 处于 old 区域的数据页，每次被访问的时候都要做下面这个判断：
+	- 若这个数据页在 LRU 链表中存在的时间超过了 1 秒，就把它移动到链表头部；
+	- 如果这个数据页在 LRU 链表中存在的时间短于 1 秒，位置保持不变。1 秒这个时间，是由参数 innodb_old_blocks_time 控制，默认是 1000，单位毫秒。
+
+通过这个策略，在扫描大表的过程中，虽然也用到了 Buffer Pool，但是对 young 区域完全没有影响，从而保证了 Buffer Pool 响应正常业务的查询命中率。
+
+
+### 小结
+
+由于 MySQL 采用的是边算边发的逻辑，因此对于数据量很大的查询结果来说，不会在 server 端保存完整的结果集。所有，如果客户端读结果不及时，会堵住 MySQL 的查询过程，但是不会把内存打爆。
+
+对于 InnoDB 引擎内部，由于有淘汰策略，大查询也不会导致内存暴涨。并且，由于 InnoDB 对 LRU 算法做了改进，冷数据的全部扫描，对 Buffer Pool 的影响也能做到可控。
+
+
+## 34 | 到底可不可以使用join？
+
+### Index Nested-Loop join
+
+    select * from t1 straight_join t2 on (t1.a=t2.a);
+
+这个语句中改用 straight_join 让 MySQL 使用固定的连接方式执行查询，这样优化器只会按照我们指定的方式去 join。在这个语句中，t1 是驱动表，t2 是被驱动表。
+
+这条语句的执行过程是，先遍历表 t1 ，然后根据从表 t1 中取出的每一行数据中的 a 值，去表 t2 中查找满足条件的记录。类似嵌套查询，用上了被驱动表中索引，称之为“Index Nested-Loop Join”，简称 NLJ。
+
+![在这里插入图片描述](https://img-blog.csdnimg.cn/20190721152434866.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
+
+#### 能不能使用 join ？
+
+如果不使用 join ，那么客户端会先用一个SQL语句查出 t1 表，再for循环连接数据库N次查询。效率显然不高，也就是 N+1 问题。
+
+#### 怎么选择驱动表？
+
+join 语句执行过程中，驱动表是走全表扫描，被驱动表是走树搜索（前提是被驱动表上有索引）。
+
+假设被驱动表的行数是 M，每次在被驱动表查一行数据，要先搜索索引 a，再搜索主键索引。时间复杂度为 2*log2M。驱动表扫描 N 行，那么整个过程中复杂度近似  N + N*2*log2M。
+
+因此使用 join 语句的话，需要让小表做驱动。
+
+
+### Simple Nested-Loop Join
+
+如果被驱动表（t2）在匹配时没有用到索引，那么每次到 t2 去匹配的时候，就要做一次全表扫描，扫描行数就是 N * M 了。虽然结果是正确的，但是算法看上去太“笨重了”。这个算法叫做“Simple Nested-Loop Join”。
+
+
+### Block Nested-Loop Join
+
+MySQL也并没有使用 Simple Nested-Loop Join 算法，而是使用了 “Block Nested-Loop Join” 算法，简称 BNL。
+
+被驱动表上没有可用的索引，算法的流程如下：
+
+1. 把表 t1 的数据读入线程内存 join_buffer 中，如果没有where条件，则是整个 t1 表放入内存；
+2. 扫描 t2 表，把表 t2 中的每一行取出来，跟 join_buffer 中的数据做对比，满足 join 条件的，作为结果集的一部分返回。
+
+![在这里插入图片描述](https://img-blog.csdnimg.cn/20190721152550198.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
+
+可以看到整个过程中扫描的行数是 N + M。由于 join_buffer是以无序数组的方式组织，因此对表 t2 中的每一行，都要做 N 次判断。总共需要在内存中做 N * M 次判断。虽然 SNL 算法也是做了 N * M 次判断，但是BNL是在内存中做的判断，因此性能更好。
+
+对于哪个表做驱动表更好，这里要考虑的因素是 join_buffer 的大小。如果 join_buffer 足够大，那么无论谁做驱动表，join_buffer 都可以一次性存入驱动表的全部数据，算法的扫描行数值都是 N + M ，内存判断次数值都是 N * M。
+
+如果 join_buffer 存不下驱动表的全部内容，那么就会采用分段放的策略。其执行过程变为：
+
+1. 扫描表 t1 ，顺序读取数据行放入 join_buffer 中，放到某一行时 join_buffer 满了，继续第 2 步；
+2. 扫描表 t2，把表 t2 中的每一行取出来，跟 join_buffer 中的数据做对比，满足 join 条件的，作为结果集的一部分返回。
+3. 清空 join_buffer；
+4. 继续扫描表 t1，顺序读取剩余数据放入 join_buffer 中，继续执行第 2 步。
+
+![在这里插入图片描述](https://img-blog.csdnimg.cn/20190721152650595.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
+
+
+用 λ * N 表示驱动表的分段数，λ 的取值范围是 (0, 1)。那么算法的执行过程：
+
+1. 扫描行数是： N +  λ * N * M ;
+2. 比较次数还是 N * M ; 
+
+
+因此，在 join_buffer 大小不足以存入驱动表的全部数据情况下，驱动表为小表时，性能更好。
+
+第一个问题：能不能使用 join 语句？
+
+1. 在被驱动表能用上索引的情况下，也就是 NLJ 算法，是可以使用 join 语句的。
+2. 如果被驱动表不能使用索引，也就是 BNL 算法，扫描行数和比较次数会很多，特别是在大表的情况下，会占用大量的系统资源。所以join 尽量不要用。
+
+
+第二个问题：如果使用 join 语句，应该使用大表做驱动表，还是小表做驱动表？
+
+1. 如果是 NLJ 算法，应该选择小表；
+2. 如果是 BNL 算法：
+	1. 在 join_buffer_size 足够大时，都一样；
+	2. 在 join_buffer_size 不够大的时候（通常情况下），选择小表。
+
+所以这个问题的结论是选择小表做驱动表。
+
+更准确的说，在决定哪个表做驱动表的时候，应该是两个表按照各自的条件过滤，过滤完成之后，计算参与 join 的各个字段的总数据量，数据量小的那个表，就是“小表”，应该作为驱动表。
 
 
 
