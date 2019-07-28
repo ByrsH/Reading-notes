@@ -1381,6 +1381,192 @@ BNL 算法对系统的影响主要包括三个方面：
 4. MySQL 目前的版本还不支持 hash join， 但你可以配合应用端自己模拟出来，理论上效果好于临时表方案。
 
 
+## 36 | 为什么临时表可以重名？
+
+内存表：指的是使用 Memory 引擎的表，建表语法是 create table ... engine=memory。这种表的数据都保存在内存里，系统重启的时候会被清空，但是表结构还在。
+
+临时表：可以使用各种引擎类型。如果是使用 InnoDB 引擎或者 MyISAM 引擎的临时表，写数据的时候是写到磁盘上的。
+
+
+### 临时表的特性
+
+![在这里插入图片描述](https://img-blog.csdnimg.cn/20190728175205930.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
+
+
+临时表在使用上的几个特点：
+
+1. 建表语法是 create temporary table ...。
+2. 一个临时表只能被创建它的 session 访问，对其他线程不可见。
+3. 临时表可以与普通表同名。
+4. session A 内有同名的临时表和普通表的时候，show create 语句，以及增删改查语句访问的是临时表。
+5. show tables 命令不显示临时表。
+6. 创建临时表的 session 结束后，会自动删除临时表。
+
+
+在 join 优化时使用临时表的原因：
+
+1. 不同 session 的临时表是可以重名的，如果有多个 session 同时执行 join 优化，不需要担心表名重复导致建表失败的问题。
+2. 不需要担心数据删除问题。如果使用普通表，在流程执行过程中客户端放生异常断开，或者数据库发生异常重启，还需要专门来清理中间过程中生成的数据表。而临时表会自动回收。
+
+
+
+
+### 临时表的应用
+
+临时表经常会被用在复杂查询的优化过程中。分库分表系统的跨库查询就是一个典型的使用场景。
+
+![在这里插入图片描述](https://img-blog.csdnimg.cn/20190728175333438.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
+
+当查询条件里面没有用到分区字段 f，只能到所有的分区中取查找满足条件的所有行，然后统一做 order by 操作。有两种常用的思路。
+
+第一种思路是，在Proxy 层的进程代码中实现排序。优点是处理速度快，拿到分库的数据以后，直接在内存中参与计算。不过这个方案缺点也很明显：
+
+1. 需要的开发工作量比较大。如果涉及到 group by、join 等操作，对中间层的开发能力要求比较高。
+2. 对 Proxy 端的压力比较大，尤其是很容易出现内存不够用和CPU 瓶颈的问题。
+
+
+第二种思路是，把各个分库拿到的数据，汇总到一个 MySQL 实例的一个表中，然后在这个汇总实例上做逻辑操作。流程类似于：
+
+- 在汇总库上创建一个临时表 temp_ht，表里包含三个字段 v、k、t_modified；
+- 在各个分库上执行
+
+
+    select v,k,t_modified from ht_x where k >= M order by t_modified desc limit 100;
+
+
+- 把分库执行的结果插入到 temp_ht 表中；
+- 执行下面语句得到结果
+
+    select v from temp_ht order by t_modified desc limit 100;
+
+
+![在这里插入图片描述](https://img-blog.csdnimg.cn/20190728175523813.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
+
+### 为什么临时表可以重名？
+
+在创建临时表时，MySQL会给表创建一个 frm 文件保存表结构定义，还要有地方保存数据。frm 文件放在临时目录下，文件名后缀是 .frm，前缀是“#sql{进程 id}_{线程 id}_序列号”。
+
+临时表数据存放：
+
+- 在 5.6 及以前版本，MySQL 会在临时文件目录下创建一个相同前缀、以 .ibd 为后缀的文件，用来存放数据文件；
+- 从 5.7 版本开始，MySQL 引入了一个临时文件表空间，专门用来存放临时文件数据。不需要再创建 .ibd 文件了。
+
+在内存中每一个表都对应一个 table_def_key，用来区分不同的表。
+
+- 普通表的 table_def_key 的值是由“库名 + 表名”组成。
+- 临时表是在 “库名 + 表名”的基础上，又加了“server_id + thread_id”。
+
+因此对于两个不同的 session 创建相同表名的临时表，它们的 table_def_key 不同，磁盘文件名也不同，因此可以并存。
+
+每个线程都有维护自己的临时表链表。每次 session 操作表的时候，先遍历链表检查是否有这个名字的临时表，如果有就优先操作临时表，如果没有再操作普通表；在 session 结束时候，对链表里的每个临时表，执行 “DROP TEMPORARY TABLE + 表名”操作。binlog 中也记录了这个 DROP ... 这条命令。
+
+
+### 临时表和主备复制
+
+在主备复制时，普通表的操作需要用到临时表，因此备库也要执行操作临时表相关的语句，所以对临时表的操作会写入 binlog。如果当前的 binlog_format=row，那么跟临时表相关的语句，就不会记录到binlog中，因为row格式会记录改变前后的真实数据值。只在 binlog_format=statment/mixed 的时候，binlog 才会记录临时表的操作。
+
+主库 M 上的两个 session 创建了同名的临时表 t1，这两个 create temporary table t1 语句都会被传到备库 s 上。MySQL在记录 binlog 的时候，会把主库执行这个语句的线程 id 写到 binlog 中，table_def_key 的命名规则是：库名 + t1 + "M 的 serverId" + "session A/B 的 thread id"
+
+
+### 小结
+
+临时表一般用于处理比较复杂的计算逻辑。由于临时表是每个线程自己可见的，所以不需要考虑多个线程执行同一个逻辑时的重名问题。相处退出时，临时表也能自动删除。
+
+在 binlog_format='row' 的时候，临时表的操作不记录到binlog中。
+
+
+
+## 37 | 什么时候会使用内部临时表？
+
+union 执行流程
+
+
+    (select 1000 as f) union (select id from t1 order by id desc limit 2);
+
+![在这里插入图片描述](https://img-blog.csdnimg.cn/20190728175717441.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
+
+可以看到，这里的内存临时表起到了暂存数据的作用，而且计算过程中还用上了临时表主键 id 的唯一性约束，实现了 union 的语义。如果上面的 union 改成 union all 的话，就没有了“去重”的语义，得到的结果直接作为结果集的一部分返回给客户端。因此也用不上临时表了。
+
+
+### group by 执行流程
+
+    select id%10 as m, count(*) as c from t1 group by m;
+
+![在这里插入图片描述](https://img-blog.csdnimg.cn/20190728175935714.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
+
+1. 创建内存临时表，表里有两个字段 m 和 c，主键是 m；
+2. 扫描表 t1 的索引 a，依次取出叶子节点上的 id 值，计算 id%10 的结果，记为 x；
+	- 如果临时表中没有主键为 x 的行，就插入一个记录 (x,1);
+	- 如果表中有主键为 x 的行，就将 x 这一行的 c 值加1；
+3. 遍历完成后，在根据字段 m 做排序，得到结果集返回给客户端。（注：5.7 版本有这一步，8.0版本就没有最后的排序）
+
+
+
+内存表的大小是有限制的，参数 tmp_table_size 就是控制这个内存大小的，默认是 16M。如果执行过程中发现内存临时表大小到达了上限，就会被内存临时表转成磁盘临时表，磁盘临时表默认使用 InnoDB 引擎。
+
+
+### group by 优化方法 -- 索引
+
+group by 的语义逻辑，是统计不同的值出现的个数。由于每一行的 id%100 的结果是无序的，所以我们就需要一个临时表，来记录并统计结果。
+
+但是如果扫描过程中可以保证出现的数据是有序的，那么 group by 将不再使用临时表，也不需要排序（5.7）。只需要从左到右，顺序扫描，依次累加。
+
+![在这里插入图片描述](https://img-blog.csdnimg.cn/20190728180008340.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
+
+
+- 当碰到第一个 1 的时候，已经知道累计了 x 个 0，结果集里的第一行就是 （0,x）;
+- 当碰到第一个 2 的时候，已经知道累计了 y 个 1，结果集里的第二行就是 （1,y）;
+
+
+在 MySQL 5.7 版本支持了 generated column 机制，用来实现列数据的关联更新。你可以用下面的方法创建一个列 z，然后在 z 列上创建一个索引。
+
+    alter table t1 add column z int generated always as(id % 100), add index(z);
+
+    select z, count(*) as c from t1 group by z;
+
+
+### group by 优化方法 -- 直接排序
+
+在 group by 语句中加入 SQL_BIG_RESULT 这个提示，就可以告诉优化器：这个语句涉及的数据量很大，请直接用磁盘临时表。避免是先使用内存临时表，在转换为磁盘临时表。
+
+MySQL的优化器发现，磁盘临时表是 B+ 数存储，存储效率不如数组高，就会直接用数组存储。
+
+    select SQL_BIG_RESULT id%100 as m, count(*) as c from t1 group by m;
+
+执行流程：
+
+1. 初始化 sort_buffer，确定放入一个整型字段，记为 m；
+2. 扫描表 t1 的索引 a，依次取出里面的 id 值，将 id%100 的值存入 sort_buffer 中；
+3. 扫描完成后，对 sort_buffer 的字段 m 做排序 （如果 sort_buffer 内存不够用，就会利用磁盘临时文件辅助排序）；
+4. 排序完成后，就得到了一个有序数组。
+5. 根据有序数组，得到数组里面的不同值，以及每个值的出现次数。
+
+![在这里插入图片描述](https://img-blog.csdnimg.cn/20190728180152487.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
+
+
+MySQL什么时候会使用内部临时表：
+
+1. 如果语句执行过程可以一边读数据，一边直接得到结果，是不需要额外内存的，否则就需要额外的内存，来保存中间结果。
+2. join_buffer 是无序数组，sort_buffer 是有序数组，临时表是二维表结构；
+3. 如果执行执行逻辑需要用到二维表特性，就会优化考虑使用临时表。比如我们的例子中，union 需要用到唯一索引约束，group by 还需要用到另外一个字段来保存累计数。
+
+### 小结
+
+group by 使用原则：
+
+1. 如果对 group by语句的结果没有排序要求，要在语句后面加 order by null（8.0 版本没有加 order by 将不再排序）；
+2. 尽量让 group by 过程用上表的索引，确认方法是 explain 结果里没有 Using temporary 和 Using filesort；
+3. 如果 group by 需要统计的数据量不大，尽量只是用内存临时表；也可以通过适当调大 tmp_table_size 参数，来避免用到磁盘临时表；
+4. 如果数据量是在太大，使用 SQL_BIG_RESULT 这个提示，来告诉优化器直接使用排序算法得到 group by 的结果。
+
+
+
+
+
+
+
+
+
 
 
 
