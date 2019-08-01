@@ -1560,35 +1560,77 @@ group by 使用原则：
 4. 如果数据量是在太大，使用 SQL_BIG_RESULT 这个提示，来告诉优化器直接使用排序算法得到 group by 的结果。
 
 
+## 38 | 都说InnoDB好，那还要不要使用Memory引擎？
+
+### 内存表的数据组织结构
+
+InnoDB 表的数据就放在主键索引树上，主键索引是 B+ 树。主键索引上的值是有序存储的，在执行 select * 的时候，就会按照叶子节点从左到右扫描。
+
+![在这里插入图片描述](https://img-blog.csdnimg.cn/2019080122043253.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
+
+与 InnoDB 引擎不同，Memory 引擎的数据和索引是分开的。
+
+![在这里插入图片描述](https://img-blog.csdnimg.cn/20190801220453311.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
+
+内存表的数据部分以数组的方式单独存放，而主键 id 索引里，存的是每个数据的位置。主键 id 是 hash 索引，可以看到索引上的key并不是有序的。
+
+InnoDB 和 Memory 引擎的数据组织方式是不同的：
+
+- InnoDB 引擎把数据放在主键索引上，其他索引上保存的是主键 id。这种方式，我们称之为索引组织表（Index Organizied Table）。
+- Memory 引擎采用的是把数据单独存放，索引上保存数据位置的数据组织形式，我们称之为堆组织表（Heap Organizied Table）。
+
+两个引擎的一些典型不同：
+
+1. InnoDB 表的数据总是有序存放的，而内存表的数据是按照写入顺序存放的；
+2. 当数据文件有空洞的时候，InnoDB 表在插入数据的时候，为了保证数据有序性，只能在固定的位置写入新值，而内存表找到空位就可以插入新值；
+3. 数据位置发生变化的时候，InnoDB 表只需要修改主键索引，，而内存表需要修改所有索引；
+4. InnoDB 表用主键索引查询时需要走一次索引查找，用普通索引查找时需要走两次索引查找。而内存表没有这个区别，所有索引的“地位”都是相同的；
+5. InnoDB 支持变长数据类型，不同记录的长度可能不同；内存表不支持 Blob 和 Text 字段，并且即使定义了 varchar(N)，实际也当作 char(N)，也就是固定长度字符串来存储，因此内存表的每行数据长度相同。
 
 
+### hash 索引和 B-Tree 索引
+
+内存表也支持 B-Tree 索引。
+
+    alter table t1 add index a_btree_index using btree (id);
+
+![在这里插入图片描述](https://img-blog.csdnimg.cn/20190801220652574.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
+
+![在这里插入图片描述](https://img-blog.csdnimg.cn/20190801220726546.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
 
 
+不建议在生产环境使用内存表的原因：
+
+1. 锁粒度问题；
+2. 数据持久化问题。
 
 
+### 内存表的锁
+
+内存表不支持行锁，只支持表锁。因此，一张表只要有更新，就会堵住其他所有在这个表上的读写操作。
 
 
+数据持久化问题
+
+数据放在内存中，是内存表的优势，同时也是一个劣势。数据库在重启的时候，所有的内存表都会被清空。
+
+把普通内存表都用 InnoDB 表来代替：
+
+1. 如果你的表更新量大，那么并发读一个很重要的参考标准，InnoDB支持行锁，并发度比内存表好；
+2. 能放到内存表的数据量都不大。如果考虑的是读性能，一个读 QPS 很高并且数据量不大的表，即使使用 InnoDB，数据也会缓存在 InnoDB Buffer Pool 里的，因此性能也不会差。
 
 
+内存临时表可以忽视掉内存表的两个不足：
 
+1. 临时表不会被其他线程访问，没有并发性的问题；
+2. 临时表重启后也是需要删除的，清空数据这个问题不存在；
+3. 备库的临时表也不会影响主库的用户线程。
 
+在查询语句优化时，使用内存临时表比 InnoDB 临时表效果更好的原因：
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-----------
+1. 相比于 InnoDB 表，使用内存表不需要写磁盘，速度更快。
+2. 索引 b 使用 hash 索引，查找的速度比 B-Tree 索引快；
+3. 临时表数据小，占用的内存有限。
 
 
 ## 39 | 自增主键为什么不是连续的？
@@ -1665,7 +1707,40 @@ mysql 有一个批量申请自增 id 的策略：
 如果申请到的主键id没用完，比如第三次分配了4个，但第三次只插入了2条记录，那么其他语句申请的id 将会是第4个id 后的新自增id。这就是主键id出现自增 id 不连续的第三种原因。
 
 
+## 40 | insert语句的锁为什么这么多？
 
+### insert ... select 语句
+
+当使用 insert ... select 语句时，会在 select 表主键索引上加 next-key lock 锁，锁住需要访问的资源，从而保证在执行时 binlog 和数据的一致性。
+
+
+### insert 循环写入
+
+对于 insert into t select ... from t 语句的执行，在5.7 版本上所有间隙会加上 next-key lock，但在 8.0 版本，next-key lock 只会加在需要访问的资源间隙。 
+
+### insert 唯一键冲突
+
+在可重复读（repeatable read）隔离级别下，发生唯一键冲突的时候，并不只是简单地报错返回，还在冲突的索引上加了锁。主键索引和唯一索引加的都是 next-key lock（读锁）。
+
+
+![在这里插入图片描述](https://img-blog.csdnimg.cn/20190801221057845.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
+
+![在这里插入图片描述](https://img-blog.csdnimg.cn/20190801221119268.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
+
+### insert into ... on duplicate key update
+
+insert into ... on duplicate key update 这个语义的逻辑是，插入一行数据，如果碰到唯一键约束，就执行后面的更新语句。会在索引上加一个排他的 next-key lock （写锁）。
+
+如果有多个列违反了唯一性约束，就会按照索引的顺序，修改跟第一个索引冲突的行。
+
+
+### 小结
+
+在可重复读隔离级别下，使用 insert ... select 语句在两个表直接拷贝数据，会给表里扫描到的记录和间隙加读锁。
+
+如果 insert 和 select 的对象是同一个表，则有可能会造成循环写入。需要引入用户临时表做优化。
+
+insert 语句如果出现唯一键冲突，会在冲突的唯一值上加共享的 next-key lock（S 锁）。因此，在遇到唯一键约束报错后，要尽快提交或回滚事务，避免加锁时间过长。
 
 
 
