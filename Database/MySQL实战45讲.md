@@ -1744,7 +1744,228 @@ insert 语句如果出现唯一键冲突，会在冲突的唯一值上加共享�
 
 
 
+## 41 | 怎么最快地复制一张表？
 
+如果可以控制对源表的扫描行数和加锁范围很小的话，我们简单地使用 insert ... select 语句即可实现。为了避免对源表加读锁，更稳妥的方案是先将数据写到外部文件，然后再写回目标表。
+
+### mysqldump 方法
+
+使用 mysqldump 命令将数据导出组成一组 INSERT 语句：
+
+    mysqldump -h$host -P$port -u$user --add-locks=0 --no-create-info --single-transaction  --set-gtid-purged=OFF db1 t --where="a>900" --result-file=/client_tmp/t.sql
+
+主要参数含义：
+1. -single-transaction 的作用是，在导出数据时不需要对表 db1.t 加表锁，而是使用 START TRANSACTION WITH CONSISTENT SNAPSHOT 的方法；
+2. -add-locks 设置为 0，表示在输出的文件结果里，不增加“LOCK TABLES t WRITE;”;
+3. -no-create-info 表示不需要导出表结构；
+4. -set-gtid-purged=off 表示不输出跟 GTID 相关的信息；
+5. -result-file 指定了输出文件的路径，其中 client 表示生成的文件是在客户端机器上的。
+6. -skip-extended-insert 表示生成的 insert 语句一条直插入一行数据。
+
+然后可以用下面命令，将这些 insert 语句放到 db2 库里去执行：
+
+    mysql -h127.0.0.1 -P13000  -uroot db2 -e "source /client_tmp/t.sql"
+
+执行流程：
+
+1. 打开文件，默认以分号为结尾读取一条条的 SQL 语句；
+2. 将 SQL 语句发送到服务端执行。
+
+
+### 导出 CSV 文件
+
+直接将结果导出成 .csv 文件：
+
+    select * from db1.t where a>900 into outfile '/server_tmp/t.csv';
+
+需要注意的是：
+
+1. 这条语句会将结果保存在服务端。
+2. into outfile 指定了文件的生成位置（/server_tmp/），这个位置受参数 secure_file_priv 的限制。其值和作用分别是：
+	1. 如果设置为 empty，表示不限制文件生成的位置，这是不安全的设置；
+	2. 如果设置为一个表示路径的字符串，就要求生成的文件只能放在这个指定的目录，或者它的子目录；
+	3. 如果设置为 NULL ，就表示禁止在这个 MySQL 实例上执行 select ... into outfile 操作。
+4. 这条命令不会覆盖同名的文件，如果有同名文件，将会报错。
+5. 生成的文本文件中，原则上一个数据行对应文本文件的一行。换行符、制表符等符号，前面会加上"\"转义符。
+
+用下面的 load data 命令将数据导入到目标表 db2.t 中：
+
+    load data infile '/server_tmp/t.csv' into table db2.t;
+
+执行流程：
+
+1. 打开文件 /server_tmp/t.csv，以制表符（\t）作为字段间的分隔符，以换行符（\n）作为记录之间的分隔符，进行数据读取；
+2. 启动事务；
+3. 判断每一行的字段数与表 db2.t 是否相同：
+	1. 不相同，直接报错，事务回滚；
+	2. 相同，则构造成一行，调用 InnoDB 引擎接口，写入到表中。
+4. 重复步骤3，知道整个文件读完，提交事务。
+
+在备库重放：
+
+1. 主库执行完成后，将 /server_tmp/t.csv 文件的内容直接写到 binlog 文件中。
+2. 往 binlog 文件中写入语句 load data local infile '/tmp/SQL_LOAD_MB-1-0' INTO TABLE `db2`.`t`。
+3. 包这个 binlog 日志传到备库。
+4. 备库的 apply 线程在执行这个事务日志时：
+	1. 先将 binlog 中的 t.csv 文件内容读出来，写入本地临时目录 /tmp/SQL_LOAD_MB-1-0 中；
+	2. 再执行 load data 语句，往备库的 db2.t 表中插入跟主库相同的数据。
+
+![在这里插入图片描述](https://img-blog.csdnimg.cn/20190825163434784.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
+
+
+load data 命令两种用法：
+
+1. 不加 “local”，是读取服务端的文件，文件必须在 secure_file_priv 指定的目录或子目录下；
+2. 加上 “local”，读取的是客户端的文件。MySQL 客户端会先把本地文件传给服务端，然后执行上述的 load data 流程。
+
+select ... into outfile 方法不会生成表结构文件，mysqldump 提供了一个参数 -tab, 可以同时导出表结构定义文件（t.sql）和 csv（t.txt） 数据文件：
+
+    mysqldump -h$host -P$port -u$user ---single-transaction  --set-gtid-purged=OFF db1 t --where="a>900" --tab=$secure_file_priv
+
+### 物理拷贝方法
+
+MySQL 5.6 版本引入了可传输表空间的方法，可以通过导出 + 导入表空间的方式，实现物理拷贝表的功能。
+
+执行流程：
+
+1. 执行 create table r like t，创建一个相同表结构的空表；
+2. 执行 alter table r discard tablespace，这时候 r.ibd 文件会被删除；
+3. 执行 flush table t for export，这时候 db1 目录下会生成一个 t.cfg 文件；
+4. 在 db1 目录下执行 cp t.cfg rcfg; cp t.ibd r.ibd；
+5. 执行 unlock tables，这时候 t.cfg 文件会被删除；
+6. 执行 alter table r import tablespace，将这个 r.ibd 文件作为表 r 的新的表空间。
+
+![在这里插入图片描述](https://img-blog.csdnimg.cn/20190825163629514.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
+
+
+### 小结
+
+三种拷贝表方法的优缺点：
+
+1. 物理拷贝方式速度最快，尤其对于大表拷贝来说是最快的方法。但有其局限性：
+	1. 必须是全表拷贝，不能只拷贝部分数据；
+	2. 需要的服务器上拷贝数据，用户无法登录数据库主机的场景下无法使用；
+	3. 由于是通过拷贝物理文件实现的，源表和目标表都是使用 InnoDB 引擎时才能使用；
+2. 用 mysqldump 生成含有 INSERT 语句文件的方法，可以在 where 参数增加过滤条件，来实现只导出部分数据。不足之一是，不能使用 join 这种比较复杂的 where 条件写法。
+3. 用 select ... into outfile 的方法是灵活的，支持所有的 SQL 写法。缺点是，每次只能导出一张表，而且表结构也需要另外的语句单独备份。
+
+
+
+## 42 | grant之后要跟着flush privileges吗？
+
+grant 语句是用来给用户赋权的。
+
+用户权限范围：
+
+### 全局权限
+
+给用户 ua 赋予最高权限：
+
+    grant all privileges on *.* to 'ua'@'%' with grant option;
+
+这个 grant 命令做了两个动作：
+
+1. 磁盘上，将 mysql.user 表里，用户 'ua'@'%' 这一行的所有表示权限的字段的值都修改为 'Y'；
+2. 内存里，从数组 acl_users 中找到这个用户对应的对象，将 access 值（权限位）修改为二进制的“全1”。
+
+基于上面的分析可以知道：
+
+1. grant 命令对于全局权限，同时更新了磁盘和内存。命令完成后即时生效，接下来新创建的连接会使用新的权限。
+2. 对于一个已经存在的连接，它的全局权限不受 grant 命令的影响。
+
+收回上面 grant 语句赋予的权限，执行动作与上面相反：
+
+    revoke all privileges on *.* from 'ua'@'%';
+
+
+### db 权限
+
+MySQL 也支持库级别的权限定义。使用下面命令让用户拥有库 db1 的所有权限：
+
+    grant all privileges on db1.* to 'ua'@'%' with grant option;
+
+基于库的权限记录保存在 mysql.db 表中，在内存里则保存在数组 acl_dbs 中。这条命令做了如下动作：
+
+1. 磁盘上，将 mysql.db 表里，用户 'ua'@'%' 这一行的所有表示权限的字段的值都修改为 'Y'；
+2. 内存里，增加一个对象到数组 acl_dbs 中，这个对象的权限位为“全1”。
+
+grant 修改 db 权限的时候，是同时对磁盘和内存生效的。
+
+![在这里插入图片描述](https://img-blog.csdnimg.cn/20190825164100140.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
+
+
+### 表权限和列权限
+
+MySQL也支持更细粒度的表权限和列权限。表权限定义存放在表 mysql.tables_priv 中，列权限定义存放在表 mysql.columns_priv 中。这两类权限，组合起来存放在内存的 hash 结构 column_pri_hash 中。
+
+赋权命令：
+
+    create table db1.t1(id int, a int);
+    
+    grant all privileges on db1.t1 to 'ua'@'%' with grant option;GRANT SELECT(id), INSERT (id,a) ON mydb.mytbl TO 'ua'@'%' with grant option;
+
+这两个权限每次 grant 的时候都会修改数据表，也会同步修改内存的 hash 结构。因此这两类权限的操作，会影响到已经存在的连接，也就是立即生效。
+
+flush privileges 命令会清空 acl_users 数组，然后从 mysql.user 表中读取数据重新加载，重新构造一个 acl_users 数组。对于 db 权限、表权限和列权限，MySQL也做同样的处理。
+
+正常情况下，grant/revoke 语句执行完后，内存和数据表会保持同步更新，因此没有必要跟着执行 flush privileges 命令。
+
+
+### flush privilege 使用场景
+
+在不规范操作的情况下，会造成内存和数据表中的数据不一致，比如直接操作系统表。这时就需要 flush privilege 语句来重建内存数据。
+
+![在这里插入图片描述](https://img-blog.csdnimg.cn/20190825164247960.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
+
+
+### 小结
+
+grant 语句会同时修改数据表和内存，判断权限的时候是使用内存数据。因此，规范地使用 grant 和 revoke 语句，是不需要随后加 flush privilege 语句的。
+
+flush privilege 语句本身会用数据表的数据重建一份内存权限数据，所以在权限数据可能存在不一致的情况下再使用。而这种不一致往往是由于直接用 DML 语句操作系统权限表导致的，所以尽量不要使用这类语句。
+
+
+
+## 43 | 要不要使用分区表？
+
+### 分区表是什么？
+
+把表数据分别存入不同的分区，每个分区对应一个 .idb 文件。对于引擎层来说，这是 n 个表，对于 Server 层来说，这是 1 个表。
+
+
+### 分区表的引擎层行为
+
+验证对应引擎层来说是 n 个表。
+
+![在这里插入图片描述](https://img-blog.csdnimg.cn/20190825164338498.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
+
+![在这里插入图片描述](https://img-blog.csdnimg.cn/20190825164357485.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
+
+
+如果单表过大，不使用分区表的话，就要使用手动分表的方式。分区表和手工分表，一个是由 server 层来决定使用哪个分区，一个是由应用层代码决定使用哪个分表。从引擎层看，这两种方式没有什么差别。性能方面也没有实质的差别。主要区别在 server 层。
+
+
+### 分区策略
+
+每当第一次访问一个分区表的时候，MySQL 需要把所有的分区都访问一遍。一个典型的报错情况是，分区表的个数已经超过了，open_files_limit 参数的值，就会报错。
+
+MyISAM 分区表使用的分区策略称为通用分区策略（generic partitioning），每次访问分区都由 server 层控制，有比较严重的性能问题。
+
+MySQL 5.7.9 开始，InnoDB 引擎引入 本地分区策略（native partitioning）。这个策略是在 InnoDB 内部自己管理打开分区的行为。
+
+从 MySQL 8.0 版本开始，就不允许创建 MyISAM 分区表了，只允许创建已经实现本地分区策略的引擎。
+
+
+### 分区表的 server 层行为
+
+1、MySQL 在第一次打开分区表的时候，需要访问所有的分区；
+2、在 server 层，认为这是同一张表，因此所有分区共用同一个 MDL 锁；
+3、在引擎层，认为是不同的表，因此 MDL 锁之后的执行过程，会根据分区表规则，只访问必要的分区。
+
+
+### 分区表的应用场景
+
+分区表的一个显而易见的优势是对业务透明，相对于用户分表来说，业务代码更简洁。分区表可以很方便的清理历史数据。
 
 
 
