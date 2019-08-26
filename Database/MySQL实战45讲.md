@@ -1,7 +1,278 @@
 
 
 
+## 13 | 为什么表数据删掉一半，表文件大小不变？
 
+主要内容：数据库表的空间回收。为什么简单地删除表数据到不到表空间回收的效果，如何正确回收空间？
+
+InnoDB表包含两部分：表结构定义和数据。MySQL8.0之前，表结构是存在 .frm 为后缀的文件里，8.0版本则允许把表结构定义放在系统数据表中了。
+
+### 参数 innodb_file_per_table
+
+参数 innodb_file_per_table 设置为OFF时，表的数据放在共享表空间，也就是跟数据字典放在一起；当设置为ON表示，每个InnoDB表数据存储在一个以.idb为后缀的文件中。从MySQL5.6.6开始，默认为ON。
+
+建议设置该值为ON。因为单独存储为一个文件更容易管理，可以通过drop table命令直接删除这个文件。如果放在共享表空间中，即使表删掉了，空间也是不会回收的。
+
+### 数据删除流程
+
+记录和数据页删除后，会被标记为删除可复用。记录的复用只限于符合范围条件的数据，当有新的记录插入时，如果位置范围是在删除的记录上，则复用。对于数据页则是可复用与任何位置。
+
+如果相邻的两个数据页利用率都很小，系统会把两个数据页上的数据合并到一个页上，另外一个数据页就被标记为可复用。
+
+如果用delete命令把整个表的数据删除，那么所有的数据页都被标记为可复用。但磁盘上，文件不会变小。
+
+delete命令只是把记录的位置，或者数据页标记为“可复用”，但磁盘文件的大小是不会变的。这些可复用，而没有被利用的空间，看起来就像是“空洞”。
+
+不仅删除数据会造成空洞，插入数据，更新索引上的值也会造成空洞。当一个在一个已满的数据页上插入数据，就会申请一个新的页面保存数据，页分裂完成后，老的数据页尾就留下了空洞。更新索引值，可以理解为删除一个旧的值，再插入一个新值。
+
+### 如何去除空洞，收缩表空间：重建表
+
+可以使用 alter table A engine=InnoDB命令来重建表。该命令的执行流程是：新建一个与表A结构相同的表B，然后按照主键ID递增的顺序，把数据一行一行从表A读出插入表B。表B就没有像表A中的空洞了，索引更加紧凑。完成后用表B替换表A。
+
+![在这里插入图片描述](https://img-blog.csdnimg.cn/20190826213749832.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
+
+在MySQL5.5之前，流程和上述描述差不多，区别是临时表B不需要你自己创建，MySQL会自动完成上述操作。在上述往临时表插入数据过程中，如果有新的数据要写入表A的话，就会造成数据丢失。因此在整个DDL过程中，表A不能有更新，也就是DDL不是Online的。
+
+MySQL5.6版本开始引入Online DDL，对操作流程做了优化：
+
+![在这里插入图片描述](https://img-blog.csdnimg.cn/20190826213819998.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
+
+![在这里插入图片描述](https://img-blog.csdnimg.cn/20190826213838523.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
+
+![在这里插入图片描述](https://img-blog.csdnimg.cn/20190826213905897.png)
+
+
+## 14 | count(*)这么慢，我该怎么办？
+
+**count(*)的实现方式**
+
+不同的MySQL引擎，count(*)有不同的实现方式：
+
+- MyISAM引擎把一个表的总行数存在了磁盘上，因此执行count(*)时会直接返回这个数，效率很高；
+- InnoDB引擎需要把数据一行一行地从引擎里面读出来，然后累计计数。
+
+InnoDB没有把总行数存起来的原因是：由于多版本并发控制（MVCC）的原因，InnoDB表“应该返回多少行”也是不确定的。
+
+在保证逻辑正确的前提下，尽量减少扫描的数据量，是数据库系统设计的通用法则之一。
+
+小结：
+
+- MyISAM表虽然count(*)很快，但是不支持事物
+- show table status 命令虽然返回很快，但是不准确
+- InnoDB表直接count(*)会遍历全表，虽然结果准确，但会导致性能问题
+
+如果要经常统计操作记录总数的话，应该自己把操作记录表的行数存起来。
+
+
+### 用缓存系统保存计数
+
+使用redis缓存来保持计数会存在不精确的问题：
+
+- redis可能会出现异常重启的情况，这时如果内存中的数据没用及时持久化的话，会丢失更新计数。
+- 即使redis正常工作，也会出现逻辑上不精确
+	- 先插入数据库数据，再更新redis计数值。这时在它们中间有一个线程读取了数据库，是有最新的插入数据，但读redis时没有计数没有增加这条记录，就会出现数据不精确
+	- 如果先更新redis计数值，再插入数据库数据。同样在它们中间一个线程先读取redis，再读取数据库，这时不能读取到要新插入到数据。
+
+
+### 在数据库保存计数
+
+如果把计数存在一个表中，就可以解决存在缓存中出现的问题：
+
+- InnoDB支持崩溃恢复不丢失数据
+- 通过InnoDB事物特性，可以确保在执行累加和插入操作未提交事物时，其他事物是看不到中间状态结果的。
+
+
+### 不同的count用法
+
+![在这里插入图片描述](https://img-blog.csdnimg.cn/20190826214434947.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
+
+
+count(*), count(主键 id), count(字段), count(1) 性能分析：
+
+- count(主键 id): InnoDB会遍历整张表，取出每一行id，然后返回给server层。server层再判断id不可能为null，按行累加。
+- count(1): 遍历整张表，但不取值，server层对返回的每一行放”1”进去，判断不可能为空，按行累加。
+- count(字段)：
+	- 如果该字段定义为非null的话，一行行从记录里取出这个字段，判断不可能为null，按行累加。
+	- 如果这个“字段”定义允许为 null,那么执行的时候,判断到有可能是 null,还要把值取出来再判断一下，不是null时才累加。
+- count(*) 是例外,并不会把全部字段取出来,而是专门做了优化,不取值。count(*) 肯定不是 null,按行累加。
+
+结论是:按照效率排序的话,count(字段)<count(主键 id)<count(1)≈count(*),所以建议尽量使用count(*)。
+
+
+## 15 | 答疑文章（一）：日志和索引相关问题
+
+
+
+## 16 | “order by”是怎么工作的？
+
+### 全字段排序
+
+![在这里插入图片描述](https://img-blog.csdnimg.cn/20190826214618758.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
+
+
+排序动作的执行，可能在内存中完成，也可能需要使用外部排序，利用磁盘临时文件辅助排序。这取决于排序所需要的内存和MySQL为排序开辟的内存（sort_buffer）的大小。sort_buffer的大小由sort_buffer_size参数决定。
+
+内部排序使用快速排序算法，外部排序一般使用归并排序算法。
+
+
+### rowid排序
+
+上述排序如果单行数据很大，那么排序性能就会很差。
+
+修改参数，当单行长度超过该值时，MySQL就会换一种算法。先取排序的字段和ID，然后排序，最后再回表取出结果集。
+
+    SET max_length_for_sort_data = 16;
+
+
+![在这里插入图片描述](https://img-blog.csdnimg.cn/20190826214709750.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
+
+
+### 全字段排序 VS rowid 排序
+
+如果MySQL认为内存足够大，会 优先选择全字段排序，若内存不够用则选择rowid排序。
+
+MySQL的一个设计思想：如果内存够，就要多利用内存，尽量减少磁盘访问。
+
+
+建立联合索引，避免执行排序：
+
+![在这里插入图片描述](https://img-blog.csdnimg.cn/20190826214753826.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
+
+
+使用覆盖索引，避免回表查询：
+
+![在这里插入图片描述](https://img-blog.csdnimg.cn/2019082621481143.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
+
+
+
+## 17 如何正确地显示随机消息？
+
+### 内存临时表
+
+Extra 字段显示 Using temporary，表示的是需要使用临时表； Using filesort，表示的是需要执行排序操作。
+
+对于InnoDB表来说，执行全字段排序会减少磁盘访问，因此会被优先选择。
+
+对于内存表，回表过程只是简单地根据数据行的位置，直接访问内存得到数据，根本不会导致多访问磁盘。优化器这时就会优先考虑的是，用于排序的行越小越好（是因为单行数据很大，那么排序性能就会很差），所以，MySQL这时就会选择rowid排序。
+
+如果你创建的表没有主键，或者把一个表的主键删掉了，那么InnoDB会自己生成一个长度为6字节的rowid来作为主键。
+
+
+![在这里插入图片描述](https://img-blog.csdnimg.cn/20190826210342342.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
+
+![在这里插入图片描述](https://img-blog.csdnimg.cn/20190826210424466.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
+
+![在这里插入图片描述](https://img-blog.csdnimg.cn/20190826210453137.png)
+
+
+order by rand() 使用了内存临时表，内存临时表排序的时候使用的是rowid排序方法。
+
+### 磁盘临时表
+
+如果临时表大小超过了tmp_table_size（默认值是16M），那么内存临时表就会转成磁盘临时表。
+
+当使用磁盘临时表的时候，对应的就是一个没有显式索引的InnoDB表的排序过程。
+
+临时文件算法-->归并排序算法
+
+优先队列排序算法:
+
+![在这里插入图片描述](https://img-blog.csdnimg.cn/20190826210557289.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
+
+
+### 随机排序方法
+
+    mysql> select count(*) into @C from t;
+    set @Y1 = floor(@C * rand());
+    set @Y2 = floor(@C * rand());
+    set @Y3 = floor(@C * rand());
+    select * from t limit @Y1，1； // 在应用代码里面取 Y1、Y2、Y3 值，拼出 SQL 后执行
+    select * from t limit @Y2，1；
+    select * from t limit @Y3，1；
+
+在实际应用的过程中，比较规范的用法就是：尽量将业务逻辑写在业务代码中，让数据库只做“读写数据”的事情。
+
+
+## 18 | 为什么这些SQL语句逻辑相同，性能却差异巨大？
+
+### 条件字段函数操作
+
+如果对字段做了函数计算，就用不上索引了。原因：对索引字段做函数操作，可能会破坏索引值的有序性，因此优化器就决定放弃走树搜索功能。 优化器会选择遍历索引（主键索引或字段索引，取决于索引大小）。
+
+要想使用到索引的快速定位能力，就要把字段的函数操作改为范围查询。比如下面两个：
+
+  ![在这里插入图片描述](https://img-blog.csdnimg.cn/20190826210720624.png)---》
+
+![在这里插入图片描述](https://img-blog.csdnimg.cn/20190826210751825.png)
+ ![在这里插入图片描述](https://img-blog.csdnimg.cn/20190826210825197.png) ---》   where id=9999
+
+
+### 隐式类型转换
+
+在mysql查询语句中，如果作为条件的值类型与字段类型不一样时，可能会存在类型转换，比如vachar类型和整数。在mysql中，字符串和数字比较的话，是将字符串转换成数字。如果varchar类型的字段转换成数字的话，将会用到函数，从而就用不上索引，将全表扫描。
+
+
+### 隐式字符编码转换
+
+当两个表的字符集不同时（例如utf8、utf8mb4），做表关联查询的时候用不上关联字段的索引。原因：当两个字符集不同时，MySQL就会先做类型转换，再进行比较。转换规则是“按数据长度增加的方向”进行转换，类似于程序设计语言中的自动类型转换。如果是被驱动表里的字段做转换，就会用到函数操作，因此该字段的索引将无法使用，优化器会放弃走树搜索功能。由此可以得出导致被驱动表做全表扫描的直接原因是：**连接过程中要求在被驱动表的索引字段上加函数操作。**
+
+优化方案：
+
+1. 改变表的编码，两个表统一编码，就不会存在字符编码转换了。这需要DDL操作，如果数据量大或业务上暂时不允许则要改变SQL语句了
+2. 改变SQL语句，主动把驱动表的关联字段改变编码和被驱动表一样。
+
+
+例如：
+
+    alter table trade_detail modify tradeid varchar(32) CHARACTER SET utf8mb4 default null;
+
+    select d.* from tradelog l, trade_detail d where d.tradeid=CONVERT(l.tradeid USING utf8) and l.id=2;
+
+
+### 总结：
+
+对索引字段做函数操作，可能会破坏索引值的有序性，因此优化器就决定放弃走树搜索功能。
+
+
+## 19 | 为什么我只查一行的语句，也执行这么慢？
+
+### 第一类：查询长时间不返回
+
+碰到这种情况大概率表被锁住了。可以使用 show processlist 命令，查看当前语句处于什么状态，然后根据不同的状态，用不同的方法处理。
+
+### 等MDL锁
+
+如果语句对应的状态是 Waiting for table metadata lock, 那么表示的是，现在有一个线程正在表t上请求或者持有MDL写锁，把select语句堵住了。
+
+![在这里插入图片描述](https://img-blog.csdnimg.cn/20190826211152420.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
+
+这类问题的处理方式，就是kill掉持有MDL写锁的线程。
+
+
+### 等 flush
+
+![在这里插入图片描述](https://img-blog.csdnimg.cn/20190826211451436.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
+
+当状态是 waiting for table flush 时，表示一个线程正要对表t做flush操作，flush操作通常很快。而这个flush table命令被别的语句堵住了，flush命令又堵住了select语句。
+
+
+### 等行锁
+
+![在这里插入图片描述](https://img-blog.csdnimg.cn/2019082621154136.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
+
+
+
+通过下面语句查询阻塞线程，然后通过  kill 线程号，杀死线程。
+
+    mysql> select * from t sys.innodb_lock_waits where locked_table=`'test'.'t'`\G
+
+
+
+### 第二类 慢查询
+
+![在这里插入图片描述](https://img-blog.csdnimg.cn/20190826213209528.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
+
+session B 更新完100万次，会生成100万个回滚日志（undo log）。 session A 第一个select是一致性读，会依次执行 undo log，执行了100万次以后，才将1结果返回。 session A第二个select查询是当前读，因此会直接得出1000001 结果。
 
 
 
