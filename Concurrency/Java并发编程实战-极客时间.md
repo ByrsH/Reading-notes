@@ -651,6 +651,132 @@ MESA 管程特有的一个编程范式，就是需要在一个 while 循环里�
 Java 内置的管程方案通过 synchronized 实现，synchronized 修饰的代码块，在编译期会自动生成相关加锁和解锁的代码，但是仅支持一个条件变量。Java 并发包实现的管程支持多个条件变量，不过并发包里的锁，需要开发人员自己进行加锁和解锁操作。
 
 
+## 09 | Java线程（上）：Java线程的生命周期在 
+
+Java 领域实现并发线程的主要手段是多线程，Java里面的线程本质上就是操作系统的线程。
+
+
+### 通用的线程生命周期
+
+线程生命周期内的 5 种状态：初始状态、可运行状态、运行状态、休眠状态和终止状态。
+
+![在这里插入图片描述](https://img-blog.csdnimg.cn/20190912185804339.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
+
+
+1、初始状态，指的是线程已经被创建，但还不允许分配 CPU 执行。这是在编程语言层面被创建，而操作系统层面，真正的线程还没被创建。
+
+2、可运行状态，指的是线程可以分配 CPU 执行。这时真正的操作系统线程已经被成功创建，所以可以分配 CPU 执行。
+
+3、运行状态，指的是有空闲的 CPU 时，操作系统会将其分配给一个可运行状态的线程，这时线程就是运行状态。
+
+4、休眠状态，指的是运行状态的线程调用一个阻塞的 API 或等待某个事件，那么状态就会转为休眠，同时释放 CPU 使用权。当线程被唤醒时进入可运行状态。
+
+5、终止状态，指的是线程执行完或者出现异常，意味着线程生命周期结束。
+
+
+### Java 中线程的生命周期
+
+Java 语言中线程共有六种状态：
+
+1. NEW（初始化状态）
+2. RUNNABLE（可运行/运行状态）
+3. BLOCKED（阻塞状态）
+4. WAITING（无时限等待）
+5. TIMED_WAITING（有时限等待）
+6. TERMINATED（终止状态）
+
+
+其中 BLOCKED、WAITING、TIMED_WAITING 对应操作系统的休眠状态。当 Java 线程处于这三种状态之一，其就永远没有 CPU 的使用权。
+
+![在这里插入图片描述](https://img-blog.csdnimg.cn/20190912185904325.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
+
+
+#### 1、 RUNNABLE 与 BLOCKED 的状态转换
+
+当线程等待 synchronized 的隐式锁时，会触发 RUNNABLE 转换成 BLOCKED 状态，当等待线程获得 synchronized 隐式锁时，就又会从 BLOCKED 状态转换为 RUNNABLE 状态。
+
+线程调用阻塞式 API 时，操作系统层面线程会转换到休眠状态。而在 jvm 层面并不关心操作系统调度相关的状态，其状态还是 RUNNABLE。
+
+
+#### 2、RUNNABLE 与 WAITING 的状态转换
+
+第一种，获得 synchronized 隐式锁的线程，调用无参数的 Object.wait() 方法。
+
+第二种，调用无参的 Thread.join() 方法。join() 是一种线程同步方法， B 线程中调用 A.join() ，那么 B 线程将会进入 WAITING 状态，当 A 线程执行完后，B 线程又转为 RUNNABLE 状态。
+
+第三种，调用 LockSupport.park() 方法。Java 并发包中的锁，都是基于它实现的。调用 LockSupport.park() 方法，当前线程会进入 WAITING 状态；调用 LockSupport.unpark(Thread thread) 方法，会唤醒目标线程。
+
+
+#### 3、RUNNABLE 与 TIMED_WAITING 的状态转换
+
+1. 调用 Thread.sleep(long millis) 方法；
+2. 获得 synchronized 隐式锁的线程，调用 Object.wait(long timeout) 方法；
+3. 调用 Thread.join(long millis) 方法；
+4. 调用 LockSupport.parkNanos(Object blocker, long deadline) 方法；
+5. 调用 LockSupprot.parkUntil(long deadline) 方法；
+
+
+#### 4、从 NEW 到 RUNNABLE 状态
+
+Java 新创建的 Thread 对象是处于 NEW 状态，线程对象调用 start() 方法就会转到 RUNNABLE 状态。
+
+创建和启动多线程（thread.start()）
+
+- 扩展Thread类
+- 实现Runable接口  
+- 实现Callable接口     
+
+
+#### 5、从 RUNNABLE 到 TERMINATED 状态
+
+线程执行完 run() 方法后，会自动转换到 TERMINATED 状态。如果执行过程中异常抛出，也会导致线程终止。强制线程终止调用 interrupt() 方法。
+
+**stop() 和 interrupt() 方法的区别**
+
+stop() 方法会立即杀死线程，如果线程持有 ReentrantLock 锁，是不会调用 ReentrantLock 的 unlock() 去释放锁的，因此其他线程也就没有机会获得 ReentrantLock 锁，这是很危险的。类似的还有 suspend() 方法和 resume() 方法。
+
+interrupt() 方法仅仅是通知线程中断，被通知的线程有机会执行一些后续的操作，同时也可以无视这个通知。收到通知的方式有两种：一种是异常，另一种是主动检测。
+
+当线程 A 处于 WAITING、TIMED_WAITING 状态时，其他线程调用 A.interrupt() 方法，会是线程 A 转到 RUNNABLE 状态，同时线程 A 的代码会触发 InterruptedException 异常。
+
+当线程 A 处于 RUNNABLE 状态时，并且阻塞在 Java.nio.channels.InterruptibleChannel 上时，如果其他线程调用 A.interrupt() ，A 会触发 ClosedByInterruptException 异常；如果阻塞在 Selector 上，会立即返回。
+
+如果线程处于 RUNNABLE 状态，并且没有阻塞在某个 I/O 操作上，中断就要依赖线程主动检测中断状态了，通过调用 isInterrupted() 方法。
+
+
+
+## 10 | Java线程（中）：创建多少线程才是合适的？
+
+使用多线程的目的主要是降低延迟，提高吞吐量。
+
+### 多线程的应用场景
+
+在并发编程领域，提升性能的本质上就是提升硬件的利用率，具体的就是，提升 I/O 利用率和 CPU 的利用率。
+
+![在这里插入图片描述](https://img-blog.csdnimg.cn/20190912190148421.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
+
+![在这里插入图片描述](https://img-blog.csdnimg.cn/20190912190214833.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
+
+如果 CPU 和 I/O 设备的利用率都很低，那么可以尝试通过增加线程来提高吞吐量。
+
+多核执行多线程提高 CPU 利用率。
+
+![在这里插入图片描述](https://img-blog.csdnimg.cn/20190912190238932.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
+
+
+### 创建多少线程合适
+
+程序大致分为 CPU 密集型计算和 I/O 密集型计算。
+
+对于 CPU 密集型的计算场景，理论上“线程的数量=CPU 核数”就是最合适的。在工程上，一般会设置为“CPU 核数 + 1”。这样的话，当线程因为偶尔的内存页失效或者其他原因导致阻塞时，额外的线程可以用上，保证CPU的利用率。如果在增加线程也只是增加线程切换的成本。
+
+对应 I/O 密集型操作，最佳的线程数与程序中 CPU 计算和 I/O 操作的耗时比相关，
+
+单核 CPU 公式：  最佳线程数 = 1 + (I/O 耗时 / CPU 耗时)。
+
+多核 CPU 公式：  最佳线程数 = CPU 核数 * [1 + (I/O 耗时 / CPU 耗时)]。
+
+apm 工具测试 CPU 耗时和 I/O 耗时。
 
 
 
