@@ -779,6 +779,68 @@ interrupt() 方法仅仅是通知线程中断，被通知的线程有机会执�
 apm 工具测试 CPU 耗时和 I/O 耗时。
 
 
+## 11 | Java线程（下）：为什么局部变量是线程安全的？
+
+### 方法是如何被执行的
+
+![在这里插入图片描述](https://img-blog.csdnimg.cn/20190915175821130.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
+
+
+每个方法在调用栈里都有自己的独立空间，称为栈帧。每个栈帧里都有对应方法需要的参数和返回地址。当调用方法时，会创建新的栈帧，并压入调用栈；当方法返回时，对应的栈帧就会被自动弹出。也就是说栈帧和方法是同生共死的。方法的调用是利用栈结构解决的。
+
+![在这里插入图片描述](https://img-blog.csdnimg.cn/2019091517585410.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
+
+
+### 局部变量存哪里？
+
+局部变量放到了调用栈里。
+
+![在这里插入图片描述](https://img-blog.csdnimg.cn/20190915180044682.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
+
+
+### 调用栈与线程
+
+每个线程都有自己独立的调用栈。
+
+
+### 线程封闭
+
+线程封闭指的是：仅在单线程内访问数据
+
+
+## 12 | 如何用面向对象思想写好并发程序？
+
+### 一、封装共享变量
+
+封装的通俗解释就是将属性和实现细节封装在对象内部，外界对象只能通过目标对象提供的公共方法来间接访问这些内部属性。
+
+利用面向对象思想写并发程序的思路：将共享变量作为对象属性封装在内部，对所有公共方法制定并发访问策略。
+
+对于那些不会发生变化的共享变量，建议使用 final 关键字来修饰。
+
+
+### 二、识别共享变量间的约束条件
+
+约束条件决定了并发访问策略。如果约束条件识别不足，很可能导致设计的并发访问策略有问题。
+
+
+### 三、制定并发访问策略
+
+并发访问策略：
+
+1. 避免共享：避免共享的技术主要是利用线程本地存储以及每个任务分配独立的线程。
+2. 不变模式：Java 领域应用的很少。例如 Actor 模式、CSP 模式以及函数式编程的基础都是不变模式。
+3. 管程以及其他同步工具：管程是 Java 领域万能的解决方案，对于特定的场景，Java 并发包提供的读写锁、并发容器等同步工具更好。
+
+
+一些宏观原则：
+
+1. 优先使用成熟的工具类。
+2. 迫不得已时才使用低级的同步原语：synchronized、Lock、Semaphore 等
+3. 避免过早优化：安全第一，并发程序首先要保证安全，出现性能瓶颈后再优化。
+
+
+
 
 
 
