@@ -840,6 +840,72 @@ apm 工具测试 CPU 耗时和 I/O 耗时。
 3. 避免过早优化：安全第一，并发程序首先要保证安全，出现性能瓶颈后再优化。
 
 
+## 13 | 理论基础模块热点问题答疑
+
+锁应是私有的、不可变的、不可重用的。
+
+方法调用是先计算参数，然后才压入栈中。日志输出时使用 {} 占位符是好的习惯，如果使用 + 拼接输出，那么不管日志级别是什么，都会计算 + 参数。
+
+在触发 InterruptedException 异常的同时，jvm 会同时把线程的中断标志位清除，所以这个时候 th.isInterrupted() 返回的是 false。因此需要依据标志位做判断依据的话，要捕获异常，重新设置中断标志位。
+
+
+## 14 | Lock和Condition（上）：隐藏在并发包中的管程
+
+Java SDK 并发包通过 Lock 和 Condition 两个接口来实现管程，其中 Lock 用于解决互斥问题，Condition 用于解决同步问题。
+
+### 再造管程的理由
+
+破坏不可抢占条件三种方案：
+
+1. 能够响应中断。synchronized 的问题是，在持有锁 A 后，如果尝试获取锁 B 失败，那么线程就进入阻塞状态，一旦死锁，就没有任何机会唤醒阻塞的线程。如果阻塞线程能够响应中断，那么就有机会是否持有的资源。
+2. 支持超时。在一段时间内没有获取到锁，不是进入阻塞状态，而是返回一个错误。
+3. 非阻塞地获取锁。在尝试获取锁失败，并不是进入阻塞状态，而是直接返回。
+
+
+Lock 的三个接口就支持上面三种方案：
+
+
+    // 支持中断的 API
+    void lockInterruptibly()
+      throws InterruptedException;
+    // 支持超时的 API
+    boolean tryLock(long time, TimeUnit unit)
+      throws InterruptedException;
+    // 支持非阻塞获取锁的 API
+    boolean tryLock();
+
+
+### 如何保证可见性
+
+Java 里多线程的可见性是通过 Happens-Before 规则保证的。synchronized 的解锁 Happens-Before 与后续对这个锁的加锁。Java SDK 里面锁利用了 volatile 相关的 Happens-Before 规则。
+
+Happens-Before 规则：
+
+1. 顺序性规则：对于线程 T1，value+=1 Happens-Before 释放锁的操作 unlock()；
+2. volatile 变量规则：由于 state = 1 会先读取 state，所以线程 T1 的 unlock() 操作 Happens-Before 线程 T2 的 lock() 操作；
+3. 传递性规则：线程 T1 的 value+=1 Happens-Before 线程 T2 的 lock() 操作。
+
+### 什么是可重入锁
+
+可重入锁指的是线程可以重复获取同一把锁。
+
+可重入函数指的是多个线程可以同时调用该函数，每个线程都能得到正确的结果；同时支持线程切换，无论被切换多少次，结果都是正确的。也就是函数是线程安全的。
+
+
+### 公平锁与非公平锁
+
+ReentrantLock 类有两个构造函数，fair 参数代表的是锁的公平策略，true 表示构造一个公平锁。
+
+公平锁在唤醒一个等待线程时，谁的等待时间长就唤醒谁。非公平锁则不提供这个保证。
+
+
+### 用锁的最佳实践
+
+1、永远只在更新对象的成员变量时加锁
+
+2、永远只在访问可变的成员变量时加锁
+
+3、永远不在调用其他对象的方法时加锁
 
 
 
