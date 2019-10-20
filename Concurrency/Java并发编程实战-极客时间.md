@@ -908,6 +908,189 @@ ReentrantLock 类有两个构造函数，fair 参数代表的是锁的公平策�
 3、永远不在调用其他对象的方法时加锁
 
 
+## 15 | Lock和Condition（下）：Dubbo如何用管程实现异步转同步？
+
+Lock 有别于 synchronized 隐式锁的三个特征：能够响应中断、支持超时和非阻塞地获取锁。
+
+Java 语言内置的管程里只有一个条件变量，而 Lock&Condition 实现了管程模型里面的多个条件变量。
+
+Lock&Condition 实现的管程里的线程等待通知只能使用 await()、signal()、signalAll()，等同与 wait()、notify()、notifyAll()，但是不能调用它们。
+
+
+### 同步与异步
+
+调用方是否需要等待结果，如果需要就是同步；如果不需要等待结果就是异步。
+
+程序支持异步的两种方式：
+
+1. 调用方创建一个子线程，在子线程中执行方法调用，这种调用我们称为异步调用；
+2. 方法实现的时候，创建一个新的线程执行主要逻辑，主线程直接 return，这种方法一般称为异步方法。
+
+
+### Dubbo 源码分析
+
+通过等待-通知机制来实现。
+
+
+## 16 | Semaphore：如何快速实现一个限流器？
+
+### 信号量模型
+
+简单概括为：一个计数器，一个等待队列，三个方法。
+
+三个方法语义：
+
+- init() ：设置计数器的初始值
+- down() ： 计数器的值减 1；如果此时计数器的值小于 0 ，则当前线程将被阻塞，否则当前线程可以继续执行。
+- up() ： 计数器值加 1；如果此时计数器的值小于或等于 0 ，则唤醒等待队列中的一个线程，并将其从等待队列中移除。
+
+
+### 如何使用信号量
+
+使用 down() 和 up() 方法的特性来保证互斥性。
+
+
+### 快速实现一个限流器
+
+semaphore 可以允许多个线程访问临界区。
+
+利用 semaphore 的 init() 初始化 N 个池化资源，再用 down() 和 up() 方法的特性来实现当访问资源线程大于 N 时线程阻塞的功能。
+
+
+## 17 | ReadWriteLock：如何快速实现一个完备的缓存？
+
+读写锁遵循以下三条基本原则：
+
+1. 允许多个线程同时读共享变量；
+2. 只允许一个线程写共享变量；
+3. 如果一个写线程正在执行写操作，此时禁止读线程读共享变量。
+
+
+### 快速实现一个缓存
+    
+    class Cache<K,V> {
+      final Map<K, V> m =
+    new HashMap<>();
+      final ReadWriteLock rwl =
+    new ReentrantReadWriteLock();
+      final Lock r = rwl.readLock();
+      final Lock w = rwl.writeLock();
+      V get(K key) {
+    V v = null;
+    // 读缓存
+    r.lock(); ①
+    try {
+      v = m.get(key); ②
+    } finally{
+      r.unlock(); ③
+    }
+    // 缓存中存在，返回
+    if(v != null) {   ④
+      return v;
+    }  
+    // 缓存中不存在，查询数据库
+    w.lock(); ⑤
+    try {
+      // 再次验证
+      // 其他线程可能已经查询过数据库
+      v = m.get(key); ⑥
+      if(v == null){  ⑦
+    // 查询数据库
+    v= 省略代码无数
+    m.put(key, v);
+      }
+    } finally{
+      w.unlock();
+    }
+    return v;
+      }
+    }
+
+
+
+### 读写锁的升级与降级
+
+先获取读锁，然后再获取写锁，叫做锁的升级。但是 ReadWriteLock 并不支持这种升级，当读锁还没释放的时候，获取写锁会导致写锁永久等待。
+
+先获取写锁，然后再获取读锁，叫做锁的降级，是允许的。
+
+
+### 总结
+
+读写锁类似于 ReentrantLock， 也支持公平模式和非公平模式。只有写锁支持条件变量，读锁不支持。
+
+
+## 18 | StampedLock：有没有比读写锁更快的锁？
+
+StampedLock 锁比读写锁性能更好。
+
+
+### StampedLock 支持的三种锁模式
+
+ReadWriteLock 支持两种模式：一种是读锁，一种是写锁。StampedLock 支持三种模式：写锁、悲观读锁和乐观读锁。
+
+ReadWriteLock 支持多个线程同时读，但是当多个线程同时读的时候，所有的写操作会被阻塞；而 StampedLock 提供的乐观读，是允许一个线程获取写锁的，不是所有的写操作都被阻塞。
+
+乐观读这个操作是无锁的，所以相比较 ReadWriteLock 的读锁，乐观读的性能更好一些。
+
+如果执行乐观读操作的期间，存在写操作，应把乐观读升级为悲观读锁。
+
+
+### 进一步理解乐观读
+
+数据库的乐观锁和 StampedLock 的乐观读很相似。数据库乐观锁通过增加一个 version 的字段版本，每次更新的时候都会 version + 1，version会作为更新的where条件，如果更新成功表示期间没有修改，如果更新失败则表示数据已经被修改。
+
+    update product_doc
+    set version=version+1，...
+    where id=777 and version=9
+
+
+### StampedLock 使用注意事项
+
+StampedLock 适用于读多写少的场景，简单的场景可以替代 ReadWriteLock。使用 StampedLock 时还应注意，它不支持重入；StampedLock 的悲观读锁、写锁都不支持条件变量；如果线程阻塞在 StampedLock 的 readLock() 或者 writeLock() 时，此时调用该阻塞线程的 interrupt() 方法，会导致 CPU 飙升。因此，在需要支持中断功能时，一定使用可中断的悲观读锁 readLockInterruptibly() 和写锁 writeLockInterruptibly() 。
+
+
+### 总结
+
+StampedLock 读模板：
+
+
+    final StampedLock sl =
+      new StampedLock();
+    
+    // 乐观读
+    long stamp =
+      sl.tryOptimisticRead();
+    // 读入方法局部变量
+    ......
+    // 校验 stamp
+    if (!sl.validate(stamp)){
+      // 升级为悲观读锁
+      stamp = sl.readLock();
+      try {
+    // 读入方法局部变量
+    .....
+      } finally {
+    // 释放悲观读锁
+    sl.unlockRead(stamp);
+      }
+    }
+    // 使用方法局部变量执行业务操作
+    ......
+
+
+StampedLock 写模板：
+
+
+    long stamp = sl.writeLock();
+    try {
+      // 写共享变量
+      ......
+    } finally {
+      sl.unlockWrite(stamp);
+    }
+
+
 
 
 
