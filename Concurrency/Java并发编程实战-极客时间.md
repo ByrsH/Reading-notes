@@ -1092,7 +1092,281 @@ StampedLock 写模板：
 
 
 
+## 19 | CountDownLatch和CyclicBarrier：如何让多线程步调一致？
 
+### 利用并行优化系统
+
+对于串行化的系统，优化性能首先想到的是能否利用多线程并行处理。
+
+
+    while(存在未对账订单){
+      // 查询未对账订单
+      Thread T1 = new Thread(()->{
+    	pos = getPOrders();
+      });
+      T1.start();
+      // 查询派送单
+      Thread T2 = new Thread(()->{
+    	dos = getDOrders();
+      });
+      T2.start();
+      // 等待 T1、T2 结束
+      T1.join();
+      T2.join();
+      // 执行对账操作
+      diff = check(pos, dos);
+      // 差异写入差异库
+      save(diff);
+    }
+
+
+### 用 CountDownLatch 实现线程等待
+
+上述实现是通过 join() 方法等待两个线程操作完退出的方式，达到保证到调用 check 方法时都已查询完成。当程序优化使用线程池时，join方法就失效了。这时就要通过 CountDownLatch 来实现了。
+
+    
+    // 创建 2 个线程的线程池
+    Executor executor =
+      Executors.newFixedThreadPool(2);
+    while(存在未对账订单){
+      // 计数器初始化为 2
+      CountDownLatch latch =
+    	new CountDownLatch(2);
+      // 查询未对账订单
+      executor.execute(()-> {
+    pos = getPOrders();
+    latch.countDown();
+      });
+      // 查询派送单
+      executor.execute(()-> {
+    	dos = getDOrders();
+    	latch.countDown();
+      });
+      
+      // 等待两个查询操作结束
+      latch.await();
+      
+      // 执行对账操作
+      diff = check(pos, dos);
+      // 差异写入差异库
+      save(diff);
+    }
+    
+
+### 进一步优化性能
+
+上述模型可以看作生产者-消费者模型。两个查询是生产者，查询数据分别存入两个队列，在都完成一次查询后，通知另一个线程消费，执行对账操作。
+
+![在这里插入图片描述](https://img-blog.csdnimg.cn/20191027153255678.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
+
+
+### 用 CyclicBarrier 实现线程同步
+
+CyclicBarrier 的计数器有自动重置的功能，当减到 0 的时候，会自动重置你设置的初始值。
+
+
+
+    // 订单队列
+    Vector<P> pos;
+    // 派送单队列
+    Vector<D> dos;
+    // 执行回调的线程池
+    Executor executor =
+      Executors.newFixedThreadPool(1);
+    final CyclicBarrier barrier =
+      new CyclicBarrier(2, ()->{
+    	executor.execute(()->check());
+      });
+      
+    void check(){
+      P p = pos.remove(0);
+      D d = dos.remove(0);
+      // 执行对账操作
+      diff = check(p, d);
+      // 差异写入差异库
+      save(diff);
+    }
+      
+    void checkAll(){
+      // 循环查询订单库
+      Thread T1 = new Thread(()->{
+    	while(存在未对账订单){
+      // 查询订单库
+      pos.add(getPOrders());
+      // 等待
+      barrier.await();
+    }
+      });
+      T1.start();  
+      // 循环查询运单库
+      Thread T2 = new Thread(()->{
+    	while(存在未对账订单){
+      // 查询运单库
+      dos.add(getDOrders());
+      // 等待
+      barrier.await();
+    }
+      });
+      T2.start();
+    }
+    
+
+### 总结
+
+CountDownLatch 主要用来解决一个线程等待多个线程的场景，CyclicBarrier 是一组线程之间互相等待。CountDownLatch 的计数器是不能循环利用的，但是 CyclicBarrier 的计数器是可以循环利用的，而且具有自动重置的功能，一旦计数器减到 0 会自动重置到初始设置的值。另外， CyclicBarrier 还可以设置回调函数。
+
+
+## 20 | 并发容器：都有哪些“坑”需要我们填？
+
+### 同步容器及其注意事项
+
+Java 中的容器主要分为四大类：List、Map、Set 和 Queue。这里面并不是所有容器都是线程安全的，我们可以通过把非线程安全的容器封装在对象内部，然后控制访问路径就能达到线程安全的目的。
+
+Java SDK 提供的包装类：
+
+    List list = Collections.
+      synchronizedList(new ArrayList());
+    Set set = Collections.
+      synchronizedSet(new HashSet());
+    Map map = Collections.
+      synchronizedMap(new HashMap());
+
+基于 synchronized 关键字实现的容器称之为同步容器。
+
+用迭代器变量包装后的同步容器，要注意对容器加锁保证互斥。
+
+
+### 并发容器及其注意事项
+
+Java 在 1.5 之前的线程安全的容器，主要指的是同步容器，所有方法使用 synchronized 来保证互斥，性能差。1.5 之后提供了性能更改的容器，称之为并发容器。
+
+![在这里插入图片描述](https://img-blog.csdnimg.cn/20191027153454737.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
+
+
+### 一、List
+
+CopyOnWriteArrayList 就是写的时候将共享变量新复制一份出来，这样就可以读操作完全无锁。
+
+![在这里插入图片描述](https://img-blog.csdnimg.cn/20191027153533793.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
+
+CopyOnWriteArrayList 仅适用于写操作非常少的场景，而且能容忍读写的短暂不一致，新写的元素不能立刻被遍历到。CopyOnWriteArrayList 迭代器是只读的，不支持增删改。
+
+
+### 二、Map
+
+ConcurrentHashMap 的 key是无序的，而 ConcurrentSkipListMap 的 key 是有序的。
+
+![在这里插入图片描述](https://img-blog.csdnimg.cn/20191027153611260.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
+
+ConcurrentSkipListMap 里面的 SkipList 数据结构称之为“跳表”，跳表插入、删除、查询操作平均的时间复杂度是 O(log n)。理论上和并发线程数无关，对性能要求更高的场景下，可以尝试使用 ConcurrentSkipListMap。
+
+
+### 三、Set
+
+内容同上。
+
+
+### 四、Queue
+
+可以从两个维度分类 Queue 并发容器。一个维度是阻塞与非阻塞，阻塞指的是当队列已满时，入队操作阻塞；当队列为空时，出队操作阻塞。另一个维度是单端与双端，单端指的是只能队尾入队，队首出队；双端指的是队首队尾皆可入队出队。阻塞队列都用 Blocking 关键字标识，单端队列使用 Queue 标识，双端队列使用 Deque 标识。
+
+#### 1、单端阻塞队列：
+
+ArrayBlockingQueue、LinkedBlockingQueue、SynchronousQueue、LinkedTransferQueue、PriorityBlockingQueue 和 DelayQueue
+
+SynchronousQueue 的生产者线程的入队操作必须等待消费者线程的出队操作。LinkedTransferQueue 性能要比 LinkedBlockingQueue 好；PriorityBlockingQueue 支持按优先级出队；DelayQueue 支持延时出队。
+
+![在这里插入图片描述](https://img-blog.csdnimg.cn/20191027153736328.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
+
+
+#### 2、双端阻塞队列：LinkedBlockingDeque
+
+![在这里插入图片描述](https://img-blog.csdnimg.cn/20191027153813807.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
+
+
+#### 3、单端非阻塞队列：ConcurrentLinkedQueue
+
+#### 4、双端非阻塞队列：ConcurrentLinkedDuque
+
+
+在使用队列时也要注意容器界限问题，如果容量没有界限可能会到时 OOM。
+
+
+
+## 21 | 原子类：无锁工具类的典范
+
+### 无锁方案的实现原理
+
+CPU 为了解决并发问题，提供了 CAS 指令（Compare And Swap）。作为一条 CPU 指令，CAS 指令本身是能够保证原子性的。
+
+使用 CAS 解决并发问题，一般都会伴有自旋，也就是循环尝试。使用 CAS 方案时注意 ABA 问题，Java中提供了AtomicStampedReference和AtomicMarkableReference来解决ABA问题，内部有维护一个版本号，每次修改都同时修改版本号。
+
+
+### Java 如何实现原子化的 count += 1
+
+    do {
+      // 获取当前值
+      oldV = xxxx；
+      // 根据当前值计算新值
+      newV = ...oldV...
+    }while(!compareAndSet(oldV,newV);
+
+
+### 原子类概览
+
+Java SDK 并发包里的原子类分为五个类别：原子化的基本数据类型、原子化的对象引用类型、原子化数组、原子化对象属性更新器和原子化的累加器。
+
+![在这里插入图片描述](https://img-blog.csdnimg.cn/20191027153929715.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
+
+
+#### 1、原子化的基本数据类型
+
+AtomicBoolean、AtomicInteger 和 AtomicLong
+
+
+    getAndIncrement() //原子化i++
+    getAndDecrement() //原子化的i--
+    incrementAndGet() //原子化的++i
+    decrementAndGet() //原子化的--i
+    //当前值+=delta，返回+=前的值
+    getAndAdd(delta)
+    //当前值+=delta，返回+=后的值
+    addAndGet(delta)
+    //CAS操作，返回是否成功
+    compareAndSet(expect, update)
+    //以下四个方法
+    //新值可以通过传入func函数来计算
+    getAndUpdate(func)
+    updateAndGet(func)
+    getAndAccumulate(x,func)
+    accumulateAndGet(x,func)
+
+
+#### 2、原子化的对象引用类型
+
+AtomicReference、AtomicStampedReference 和 AtomicMarkableReference，利用它们可以实现对象引用的原子化更新。注意AtomicReference 有ABA 问题，其他两个可以解决 ABA 问题。其原理是增加版本号。
+
+
+#### 3、原子化数组
+
+AtomicIntegerArray、AtomicLongArray 和 AtomicReferenceArray，利用这些原子类，可以原子化地更新数组里面的每一个元素。
+
+
+#### 4、原子化对象属性更新器
+
+AtomicIntegerFieldUpdater、AtomicLongFieldUpdater 和 AtomicReferenceFieldUpdater，利用它们可以原子化地更新对象的属性。都是通过反射机制实现的。
+
+对象属性必须是 volatile 类型的，只有这样才能保证可见性。
+
+
+#### 5、原子化的累加器
+
+DoubleAccumulator、DoubleAdder、LongAccumulator 和 LongAdder，仅仅用来执行累加操作，速度更快，但不支持 compareAndSet() 方法。
+
+
+### 总结
+
+无锁方案相比较互斥锁方案，首先性能好，其次是基本不会出现死锁问题（但可能出现饥饿和活锁问题，因为自旋会反复重试）。
 
 
 
