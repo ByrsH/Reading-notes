@@ -1370,6 +1370,185 @@ DoubleAccumulator、DoubleAdder、LongAccumulator 和 LongAdder，仅仅用来�
 
 
 
+## 22 | Executor与线程池：如何创建正确的线程池？
+
+线程是一个重量级的对象，应该避免频繁创建和销毁。
+
+
+### 线程池是生产者-消费者模式
+
+线程池的设计是采用生产者 - 消费者模式，线程池的使用方是生产者，线程池本身是消费者。
+
+
+### 如何使用 Java 中的线程池
+
+
+    ThreadPoolExecutor(
+      int corePoolSize,
+      int maximumPoolSize,
+      long keepAliveTime,
+      TimeUnit unit,
+      BlockingQueue<Runnable> workQueue,
+      ThreadFactory threadFactory,
+      RejectedExecutionHandler handler)
+
+各参数的含义：
+
+- corePoolSize：表示线程池保有的最小线程数。
+- maximumPoolSize：表示线程池创建的最大线程数。
+- keepAliveTime & unit：如果一个线程空闲了 keepAliveTime 和 unit 长时间，而且线程池的线程数大于 corePoolSize，那么这个空闲的线程就要被回收了。
+- workQueue：工作队列
+- threadFactory：通过这个参数可以自定义如何创建线程，例如指定一个有意义的名字。
+- handler：可以自定义任务的拒绝策略。当所有线程都在忙，并且工作队列也已满，那么再提交任务，线程池就会拒绝接收。ThreadPoolExecutor 提供了以下 4 种策略：
+	- CallerRunsPolicy：提交任务的线程自己去执行该任务
+	- AbortPolicy：默认的拒绝策略，会 throws RejectedExecutionException
+	- DiscardPolicy：直接丢弃任务，没有任何异常抛出
+	- DiscardOldestPolicy：丢弃最老的任务，把最早进入工作队列的任务丢弃，然后把新任务加入到工作队列
+
+
+### 使用线程池要注意些什么
+
+线程池不允许使用 Executors 去创建，而是通过 ThreadPoolExecutor 的方式，这样的处理方式让写的同学更加明确线程池的运行规则，规避资源耗尽的风险。
+
+说明：Executors 返回的线程池对象的弊端如下：
+
+1）FixedThreadPool 和 SingleThreadPool:
+允许的请求队列长度为 Integer.MAX_VALUE，可能会堆积大量的请求，从而导致 OOM。
+
+2）CachedThreadPool 和 ScheduledThreadPool:
+允许的创建线程数量为 Integer.MAX_VALUE，可能会创建大量的线程，从而导致 OOM。
+
+
+如果使用默认的拒绝策略，要注意 catch 拒绝任务时抛出的异常。另外调用 execute() 方法提交任务时，如果运行中出现异常，会导致执行任务的线程终止。因此需要捕获所有的异常并按需处理。
+
+    try {
+      //业务逻辑
+    } catch (RuntimeException x) {
+      //按需处理
+    } catch (Throwable x) {
+      //按需处理
+    }
+
+
+## 23 | Future：如何用多线程实现最优的“烧水泡茶”程序？
+
+### 如何获取任务执行结果
+
+
+    // 提交Runnable任务
+    Future<?> submit(Runnable task);
+    
+    // 提交Callable任务
+    <T> Future<T> submit(Callable<T> task);
+    
+    // 提交Runnable任务及结果引用  
+    <T> Future<T> submit(Runnable task, T result);
+
+Future 接口的5个方法，需要注意的是两个 get() 方法是阻塞式的。
+
+
+    // 取消任务
+    boolean cancel(
+      boolean mayInterruptIfRunning);
+    // 判断任务是否已取消  
+    boolean isCancelled();
+    // 判断任务是否已结束
+    boolean isDone();
+    // 获得任务执行结果
+    get();
+    // 获得任务执行结果，支持超时
+    get(long timeout, TimeUnit unit);
+
+
+3个submit 方法之间的区别：
+
+1. 提交 Runnable 任务 submit(Runnable task)：Runnable 接口的 run 方法没有返回值，所以返回的 Future 仅可以用来断言任务已经结束。
+2. 提交 Callable 任务 submit(Callable<T> task)：返回的 Future 可以通过 get() 方法获取返回值。
+3. 提交 Runnable 任务及结果引用 submit(Runnable task, T result) ： result 用于主子线程共享数据，Runnable 的实现类包含 result 参数构造器，这样就可以在线程中操作 result 了。Future 通过get() 方法获取到的和传入的是同一个对象。
+
+
+### FutureTask 使用：
+
+    // 创建FutureTask
+    FutureTask<Integer> futureTask
+      = new FutureTask<>(()-> 1+2);
+    // 创建线程池
+    ExecutorService es =
+      Executors.newCachedThreadPool();
+    // 提交FutureTask
+    es.submit(futureTask);
+    // 获取计算结果
+    Integer result = futureTask.get();
+    
+
+### 实现最优的“烧水泡茶”程序
+
+![在这里插入图片描述](https://img-blog.csdnimg.cn/20191031103830729.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
+
+
+    // 创建任务T2的FutureTask
+    FutureTask<String> ft2
+      = new FutureTask<>(new T2Task());
+    // 创建任务T1的FutureTask
+    FutureTask<String> ft1
+      = new FutureTask<>(new T1Task(ft2));
+    // 线程T1执行任务ft1
+    Thread T1 = new Thread(ft1);
+    T1.start();
+    // 线程T2执行任务ft2
+    Thread T2 = new Thread(ft2);
+    T2.start();
+    // 等待线程T1执行结果
+    System.out.println(ft1.get());
+    
+    // T1Task需要执行的任务：
+    // 洗水壶、烧开水、泡茶
+    class T1Task implements Callable<String>{
+      FutureTask<String> ft2;
+      // T1任务需要T2任务的FutureTask
+      T1Task(FutureTask<String> ft2){
+    	  this.ft2 = ft2;
+      }
+      @Override
+      String call() throws Exception {
+    	  System.out.println("T1:洗水壶...");
+    	  TimeUnit.SECONDS.sleep(1);
+    
+    	  System.out.println("T1:烧开水...");
+    	  TimeUnit.SECONDS.sleep(15);
+    	  // 获取T2线程的茶叶  
+    	  String tf = ft2.get();
+    	  System.out.println("T1:拿到茶叶:"+tf);
+    
+    	  System.out.println("T1:泡茶...");
+    	  return "上茶:" + tf;
+      }
+    }
+    // T2Task需要执行的任务:
+    // 洗茶壶、洗茶杯、拿茶叶
+    class T2Task implements Callable<String> {
+      @Override
+      String call() throws Exception {
+    	  System.out.println("T2:洗茶壶...");
+    	  TimeUnit.SECONDS.sleep(1);
+    
+    	  System.out.println("T2:洗茶杯...");
+    	  TimeUnit.SECONDS.sleep(2);
+    
+    	  System.out.println("T2:拿茶叶...");
+    	  TimeUnit.SECONDS.sleep(1);
+    	  return "龙井";
+      }
+    }
+    // 一次执行结果：
+    T1:洗水壶...
+    T2:洗茶壶...
+    T1:烧开水...
+    T2:洗茶杯...
+    T2:拿茶叶...
+    T1:拿到茶叶:龙井
+    T1:泡茶...
+    上茶:龙井
 
 
 
