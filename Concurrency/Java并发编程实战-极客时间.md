@@ -1552,6 +1552,205 @@ Future 接口的5个方法，需要注意的是两个 get() 方法是阻塞式�
 
 
 
+## 24 | CompletableFuture：异步编程没那么难
+
+异步化是利用多线程优化性能这个核心方案得以实施的基础。
+
+
+### CompletableFuture 的核心优势
+
+- 无需手工维护线程
+- 语义更清晰
+- 代码更简练并且专注于业务逻辑
+
+
+### 创建 CompletableFuture 对象
+
+    //使用默认线程池
+    static CompletableFuture<Void>
+      runAsync(Runnable runnable)
+    static <U> CompletableFuture<U>
+      supplyAsync(Supplier<U> supplier)
+    //可以指定线程池  
+    static CompletableFuture<Void>
+      runAsync(Runnable runnable, Executor executor)
+    static <U> CompletableFuture<U>
+      supplyAsync(Supplier<U> supplier, Executor executor)  
+
+Runnable 接口 run() 方法没有返回值，Supplier 接口的 get() 方法是有返回值的。后面两个参数可以指定线程池参数。
+
+CompletableFuture 默认情况下使用公共的 ForkJoinPool 线程池，这个线程池默认的线程数是 CPU 的核数，也可以通过 JVM option:-Djava.util.concurrent.ForkJoinPool.common.parallelism 来设置线程数。强烈建议要根据不同的业务类型创建不同的线程池，以避免互相干扰。
+
+创建完 CompletableFuture 对象后，会自动地异步执行 runnable.run() 方法或者 supplier.get() 方法。
+
+
+### 如何理解 CompletionStage 接口
+
+任务的时序关系：
+
+![在这里插入图片描述](https://img-blog.csdnimg.cn/20191102235610791.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
+
+AND 聚合关系指的是所有依赖的任务都完成后才开始执行当前任务。OR 聚合关系指的是依赖的任务只要有一个完成就可以执行当前任务。
+
+
+#### 1、描述串行关系
+
+CompletionStage 接口里面描述串行关系，主要是 thenApply、thenAccept、thenRun 和 thenCompose 四个系列的接口。
+
+    CompletionStage<R> thenApply(fn);
+    CompletionStage<R> thenApplyAsync(fn);
+    CompletionStage<Void> thenAccept(consumer);
+    CompletionStage<Void> thenAcceptAsync(consumer);
+    CompletionStage<Void> thenRun(action);
+    CompletionStage<Void> thenRunAsync(action);
+    CompletionStage<R> thenCompose(fn);
+    CompletionStage<R> thenComposeAsync(fn);
+
+用例：
+
+    CompletableFuture<String> f0 =
+      CompletableFuture.supplyAsync(
+        () -> "Hello World")  //①
+      .thenApply(s -> s + " QQ")  //②
+      .thenApply(String::toUpperCase);//③
+    
+    System.out.println(f0.join());
+    //输出结果
+    HELLO WORLD QQ
+
+
+### 2、描述 AND 汇聚关系
+
+    CompletionStage<R> thenCombine(other, fn);
+    CompletionStage<R> thenCombineAsync(other, fn);
+    CompletionStage<Void> thenAcceptBoth(other, consumer);
+    CompletionStage<Void> thenAcceptBothAsync(other, consumer);
+    CompletionStage<Void> runAfterBoth(other, action);
+    CompletionStage<Void> runAfterBothAsync(other, action);
+
+
+### 3、描述 OR 汇聚关系
+
+    CompletionStage applyToEither(other, fn);
+    CompletionStage applyToEitherAsync(other, fn);
+    CompletionStage acceptEither(other, consumer);
+    CompletionStage acceptEitherAsync(other, consumer);
+    CompletionStage runAfterEither(other, action);
+    CompletionStage runAfterEitherAsync(other, action);
+
+
+### 4、异常处理
+
+    CompletionStage exceptionally(fn);
+    CompletionStage<R> whenComplete(consumer);
+    CompletionStage<R> whenCompleteAsync(consumer);
+    CompletionStage<R> handle(fn);
+    CompletionStage<R> handleAsync(fn);
+
+exceptionally() 方法处理异常，非常类似于 try{} catch{}。whenComplete 和 handle 系列方法就非常类似于 try{} finally{} ，它们之间的区别在于 whenComplete() 不支持返回结果，handle 支持返回结果。
+
+
+    CompletableFuture<Integer>
+      f0 = CompletableFuture
+          .supplyAsync(()->7/0))
+    	  .thenApply(r->r*10)
+    	  .exceptionally(e->0);
+    System.out.println(f0.join());
+
+
+
+## 25 | CompletionService：如何批量执行异步任务？
+
+### 利用 Completion 实现询价系统
+
+CompletionService 的实现原理是内部维护了一个阻塞队列，把任务执行结果的 Future 对象加入到阻塞队列中。
+
+
+### 如何创建 CompletionService
+
+
+    ExecutorCompletionService(Executor executor)
+    
+    ExecutorCompletionService(Executor executor, BlockingQueue<Future<V>> completionQueue)
+
+如果不指定 completionQueue， 那么默认会使用无界的 LinkedBlockingQueue。
+
+
+    // 创建线程池
+    ExecutorService executor =
+      Executors.newFixedThreadPool(3);
+    // 创建CompletionService
+    CompletionService<Integer> cs = new
+      ExecutorCompletionService<>(executor);
+    // 异步向电商S1询价
+    cs.submit(()->getPriceByS1());
+    // 异步向电商S2询价
+    cs.submit(()->getPriceByS2());
+    // 异步向电商S3询价
+    cs.submit(()->getPriceByS3());
+    // 将询价结果异步保存到数据库
+    for (int i=0; i<3; i++) {
+      Integer r = cs.take().get();
+      executor.execute(()->save(r));
+    }
+
+
+### CompletionService 接口说明
+
+
+    Future<V> submit(Callable<V> task);
+    Future<V> submit(Runnable task, V result);
+    Future<V> take()
+      throws InterruptedException;
+    Future<V> poll();
+    Future<V> poll(long timeout, TimeUnit unit)
+      throws InterruptedException;
+
+如果阻塞队列是空的，那么调用 take() 方法的线程会被阻塞，而 poll() 方法会返回 null 值。
+
+
+### 利用 CompletionService 实现 Dubbo 中的 ForKing Cluster
+
+
+    // 创建线程池
+    ExecutorService executor =
+      Executors.newFixedThreadPool(3);
+    // 创建CompletionService
+    CompletionService<Integer> cs =
+      new ExecutorCompletionService<>(executor);
+    // 用于保存Future对象
+    List<Future<Integer>> futures =
+      new ArrayList<>(3);
+    //提交异步任务，并保存future到futures
+    futures.add(
+      cs.submit(()->geocoderByS1()));
+    futures.add(
+      cs.submit(()->geocoderByS2()));
+    futures.add(
+      cs.submit(()->geocoderByS3()));
+    // 获取最快返回的任务执行结果
+    Integer r = 0;
+    try {
+      // 只要有一个成功返回，则break
+      for (int i = 0; i < 3; ++i) {
+    	r = cs.take().get();
+    	//简单地通过判空来检查是否成功返回
+    	if (r != null) {
+     	 break;
+    	}
+      }
+    } finally {
+      //取消所有任务
+      for(Future<Integer> f : futures)
+    f.cancel(true);
+    }
+    // 返回结果
+    return r;
+
+
+### 总结
+
+当需要批量提交异步任务的时候建议你使用 CompletionService。CompletionService 将线程池 Executor 和阻塞队列 BlockingQueue 的功能融合在一起，能够让批量异步任务的管理更简单。
 
 
 
