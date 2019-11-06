@@ -1753,6 +1753,163 @@ CompletionService 的实现原理是内部维护了一个阻塞队列，把任�
 当需要批量提交异步任务的时候建议你使用 CompletionService。CompletionService 将线程池 Executor 和阻塞队列 BlockingQueue 的功能融合在一起，能够让批量异步任务的管理更简单。
 
 
+## 26 | Fork/Join：单机版的MapReduce
+
+对于简单的并行任务，可以通过“线程池 + Future”的方案来解决；如果任务之间有聚合关系，无论是 AND 聚合还是 OR 聚合，都可以通过 CompletableFuture 来解决；而批量的并行任务，则可以通过 CompletionService 来解决。
+
+![在这里插入图片描述](https://img-blog.csdnimg.cn/20191106094825978.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
+
+分治，即分而治之，是一种解决复杂问题的思维方法和模式；具体指的是把一个复杂的问题分解成多个相似的子问题，然后再把子问题分解成更小的子问题，直到子问题简单到可以直接求解。
+
+
+### 分治任务模型
+
+分治模型可分为两个阶段：一个阶段是任务分解，也就是将任务迭代地分解为子任务，直至子任务可以直接计算出结果；另一个阶段是结果合并，即逐层合并子任务的执行结果，直至获得最终结果。
+
+![在这里插入图片描述](https://img-blog.csdnimg.cn/20191106094850725.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
+
+任务和子任务具有相似性体现在其算法是相同的，但数据规模是不同的。这种相似性问题，往往都采用递归算法。
+
+
+### Fork/Join 的使用
+
+Fork/Join 是一个并行计算的框架，主要就是用来支持分治任务模型的，这个计算框架里的 Fork 对应的是分治任务模型里的任务分解，Join 对应的是结果合并。Fork/Join 计算框架主要包含两部分，一部分是分治任务的线程池 ForkJoinPool，另一部分是分治任务 ForkJoinTask。
+
+ForkJoinTask 是一个抽象类，其中 fork() 方法会异步执行一个子任务，而 join() 方法则会阻塞当前线程来等待子任务的执行结果。
+
+使用 Fork/Join 来实现斐波那契数列：
+
+
+    static void main(String[] args){
+      //创建分治任务线程池  
+      ForkJoinPool fjp =
+    	new ForkJoinPool(4);
+      //创建分治任务
+      Fibonacci fib =
+    	new Fibonacci(30);   
+      //启动分治任务  
+      Integer result =
+    	fjp.invoke(fib);
+      //输出结果  
+      System.out.println(result);
+    }
+    //递归任务
+    static class Fibonacci extends
+    RecursiveTask<Integer>{
+      final int n;
+      Fibonacci(int n){this.n = n;}
+      protected Integer compute(){
+    	if (n <= 1)
+      		return n;
+    	Fibonacci f1 = new Fibonacci(n - 1);
+    	//创建子任务  
+    	f1.fork();
+    	Fibonacci f2 = new Fibonacci(n - 2);
+    	//等待子任务结果，并合并结果  
+    	return f2.compute() + f1.join();
+      }
+    }
+
+
+### ForkJoinPool 工作原理
+
+ForkJoinPool 本质上也是一个生产者 - 消费者的实现，但是其更加智能。ThreadPoolExecutor 内部只有一个任务队列，而 ForkJoinPool 内部有多个任务队列，当通过 invoke() 或者 submit() 方法提交任务是，ForkJoinPool 会根据一定的路由规则把任务提交到一个任务队列中，如果任务在执行过程中会创建子任务，那么子任务会提交到工作线程对应的任务队列。
+
+如果工作线程任务队列空了，那么它会执行其他任务队列中的任务。任务队列采用的是双端队列，正常线程获取任务和“窃取任务”分别是从不同的端获取的，避免不必要的数据竞争。
+
+![在这里插入图片描述](https://img-blog.csdnimg.cn/20191106095101625.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
+
+
+### 模拟 MapReduce 统计单次数量
+
+
+    static void main(String[] args){
+      String[] fc = {"hello world",
+      "hello me",
+      "hello fork",
+      "hello join",
+      "fork join in world"};
+      //创建ForkJoin线程池
+      ForkJoinPool fjp =
+      new ForkJoinPool(3);
+      //创建任务
+      MR mr = new MR(
+      fc, 0, fc.length);  
+      //启动任务
+      Map<String, Long> result =
+      fjp.invoke(mr);
+      //输出结果
+      result.forEach((k, v)->
+    System.out.println(k+":"+v));
+    }
+    //MR模拟类
+    static class MR extends
+      RecursiveTask<Map<String, Long>> {
+      private String[] fc;
+      private int start, end;
+      //构造函数
+      MR(String[] fc, int fr, int to){
+    this.fc = fc;
+    this.start = fr;
+    this.end = to;
+      }
+      @Override protected
+      Map<String, Long> compute(){
+    if (end - start == 1) {
+      return calc(fc[start]);
+    } else {
+      int mid = (start+end)/2;
+      MR mr1 = new MR(
+      fc, start, mid);
+      mr1.fork();
+      MR mr2 = new MR(
+      fc, mid, end);
+      //计算子任务，并返回合并的结果
+      return merge(mr2.compute(),
+      mr1.join());
+    }
+      }
+      //合并结果
+      private Map<String, Long> merge(
+      Map<String, Long> r1,
+      Map<String, Long> r2) {
+    Map<String, Long> result =
+    new HashMap<>();
+    result.putAll(r1);
+    //合并结果
+    r2.forEach((k, v) -> {
+      Long c = result.get(k);
+      if (c != null)
+    result.put(k, c+v);
+      else
+    result.put(k, v);
+    });
+    return result;
+      }
+      //统计单词数量
+      private Map<String, Long>
+      calc(String line) {
+    Map<String, Long> result =
+    new HashMap<>();
+    //分割单词
+    String [] words =
+    line.split("\\s+");
+    //统计单词数量
+    for (String w : words) {
+      Long v = result.get(w);
+      if (v != null)
+    result.put(w, v+1);
+      else
+    result.put(w, 1L);
+    }
+    return result;
+      }
+    }
+
+
+### 总结
+
+Fork/Join 并行计算框架主要解决的是分治任务，核心组件是 ForkJoinPool。ForkJoinPool 支持任务窃取机制，能够让所有线程的工作量基本平衡，不会出现有的线程很忙，有的线程很闲的状况，所以性能很好。Java 1.8 提供的 Stream API 里面并行流是以 ForkJoinPool 为基础的。默认情况下所有的并行流计算都共享一个 ForkJoinPool，如果是 I/O 密集型的并行流计算，那会因为一个很慢的 I/O 计算而拖慢整个系统的性能。所有建议用不同的 ForkJoinPool 执行不同类型的计算任务。
 
 
 
