@@ -1913,6 +1913,95 @@ Fork/Join 并行计算框架主要解决的是分治任务，核心组件是 For
 
 
 
+## 27 | 并发工具类模块热点问题答疑
+
+Semaphore 允许多个线程访问一个临界区，如果需要访问共享变量就会存在并发问题，所以必须加锁，也就是说 Semaphore 需要锁中锁。
+
+申请锁和释放锁需要成对出现，最佳实践 try{} finally{}。
+
+CyclicBarrier 是同步调用回调函数之后才唤醒等待的线程。所以，当遇到回调函数的时候，一定要确认下执行回调函数的线程是哪一个。执行回调函数的线程是将 CyclicBarrier 内部计数器减到 0 的那个线程。
+
+
+## 28 | Immutability模式：如何利用不变性解决并发问题？
+
+不变性模式：简单来讲，就是对象一旦被创建之后，状态就不再发生变化。当变量只有读操作，没有写操作，就保持了不变性，也就没有了并发问题。
+
+
+### 快速实现具备不可变性的类
+
+将一个类所有的属性都用 final 关键字修饰，并且只允许存在只读方法，那么这个类就具备不可变性了。更严格的做法是类本身也是 final 的。
+
+JDK 中很多类具备不可变性，例如 String 、Long、Integer、Double 等，它们都具备：类和属性都是 final 的，所有方法均是只读的。
+
+
+### 利用享元模式避免创建重复对象
+
+利用享元模式可以减少创建对象的数量，从而减少内存占用。Java 语言里的基本数据类型的包装类型 Long、Integer、Short、Byte 等都用到了享元模式。
+
+享元模式创建对象的逻辑：创建之前，首先查看对象池中是否存在；如果已经存在，就利用对象池里的对象；如果不存在，就会创建一个新的对象，并且把新对象放入对象池中。
+
+由于基础类型的包装类使用了享元模式，内部缓存了部分数据，因此不适合做锁。很有可能共用的缓存对象当做了共用的锁去使用。
+
+
+### 使用 Immutability 模式的注意事项
+
+1、对象的所有属性都是 final 的，并不能保证不可变性（成员变量为普通对象的属性是可变的）；
+
+2、不可变对象也需要正确发布。
+
+在使用 Immutability 模式的时候一定要确认保持不变性的边界在哪里，是否要求属性对象也具备不可变性。
+
+不可变对象虽然是线程安全的，但是并不意味着引用这些不可变对象的对象就是线程安全的。如果仅仅要保证变量的可见性，那么可以将变量声明为 volatile 变量。如果要保证原子性，那么可以通过原子类来实现。
+
+
+    public class SafeWM {
+      class WMRange{
+    	final int upper;
+    	final int lower;
+    	WMRange(int upper,int lower){
+    		//省略构造函数实现
+    	}
+      }
+      final AtomicReference<WMRange>
+    	rf = new AtomicReference<>(
+      		new WMRange(0,0)
+    	);
+      // 设置库存上限
+      void setUpper(int v){
+    	while(true){
+      		WMRange or = rf.get();
+      		// 检查参数合法性
+     		if(v < or.lower){
+    			throw new IllegalArgumentException();
+      		}
+      		WMRange nr = new
+      		WMRange(v, or.lower);
+      		if(rf.compareAndSet(or, nr)){
+    			return;
+      		}
+    	}
+      }
+    }
+    
+
+## 29 | Copy-on-Write模式：不是延时策略的COW
+
+Copy-on-Write 顾名思义写时复制。经常缩写为 COW 或者 CoW。
+
+
+### Copy-on-Write 模式的应用领域
+
+CopyOnWriteArrayList 和 CopyOnWriteArraySet 这两个容器实现的读操作是无锁的。
+
+Copy-on-Write 最大的应用领域是在函数式编程领域。函数式编程的基础是不可变性。
+
+
+### 一个真实案例
+
+Rpc 负载均衡服务提供方路由信息，读多写少的场景。
+
+Copy-on-Write 的缺点就是消耗内存，每次修改都需要复制一个新的对象出来。
+
 
 
 
