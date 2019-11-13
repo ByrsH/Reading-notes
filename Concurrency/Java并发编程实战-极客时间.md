@@ -2003,7 +2003,102 @@ Rpc 负载均衡服务提供方路由信息，读多写少的场景。
 Copy-on-Write 的缺点就是消耗内存，每次修改都需要复制一个新的对象出来。
 
 
+## 30 | 线程本地存储模式：没有共享，就没有伤害
 
+Java 提供了线程本地存储（ThreadLocal）能够做到避免共享。
+
+
+### ThreadLocal 的使用方法
+
+    static class SafeDateFormat {
+      //定义ThreadLocal变量
+      static final ThreadLocal<DateFormat>
+      tl=ThreadLocal.withInitial(
+    	()-> new SimpleDateFormat(
+      	"yyyy-MM-dd HH:mm:ss"));
+      
+      static DateFormat get(){
+    	return tl.get();
+      }
+    }
+    //不同线程执行下面代码
+    //返回的df是不同的
+    DateFormat df =
+      SafeDateFormat.get()；
+
+
+### ThreadLocal 的工作原理
+
+
+![在这里插入图片描述](https://img-blog.csdnimg.cn/20191113102312146.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
+
+
+    class Thread {
+      //内部持有ThreadLocalMap
+      ThreadLocal.ThreadLocalMap
+    	threadLocals;
+    }
+    class ThreadLocal<T>{
+      public T get() {
+    	//首先获取线程持有的
+    	//ThreadLocalMap
+    	ThreadLocalMap map =
+      		Thread.currentThread().threadLocals;
+    	//在ThreadLocalMap中
+    	//查找变量
+    	Entry e = map.getEntry(this);
+    	return e.value;  
+      }
+      static class ThreadLocalMap{
+    	//内部是数组而不是Map
+    	Entry[] table;
+    	//根据ThreadLocal查找Entry
+    	Entry getEntry(ThreadLocal key){
+      	//省略查找逻辑
+    	}
+    	//Entry定义
+      static class Entry extends
+    	WeakReference<ThreadLocal>{
+      		Object value;
+    	}
+      }
+    }
+    
+
+Java 的实现中，ThreadLocalMap 是属于 Thread，ThreadLocal 仅仅是一个工具类，内部并不持有任何与线程相关的数据，所有和线程相关的数据都存储在 Thread 里面。不容易产生内存泄漏。Thread 被回收时，ThreadLocalMap 就能被回收。
+
+
+### ThreadLocal 与内存泄漏
+
+线程池中的 ThreadLocal 有可能导致内存泄漏，因为线程池中的线程存活时间太长，往往都是和程序同生共死，这就意味着 ThreadLocalMap 一直都不会被回收。Entry 对 ThreadLocal 是弱引用，Entry对 value 是强引用。
+
+可以通过 try{} finally{} 方案，手动释放资源。
+
+
+    ExecutorService es;
+    ThreadLocal tl;
+    es.execute(()->{
+      //ThreadLocal增加变量
+      tl.set(obj);
+      try {
+   	 	// 省略业务逻辑代码
+      }finally {
+    	//手动清理ThreadLocal
+    	tl.remove();
+      }
+    });
+    
+
+### InheritableThreadLocal 与继承性
+
+通过 ThreadLocal 创建的线程变量，其子线程是无法继承的，也就是无法访问父线程创建的变量。
+
+InheritableThreadLocal 是 ThreadLocal 的子类，是可以继承父线程创建的线程变量。同样不建议在线程池中使用 InheritableThreadLocal，不仅会导致内存泄漏，还有可能因为线程的动态创建导致继承关系错乱。
+
+
+### 总结
+
+线程本地存储模式本质上是一种避免共享的方案。
 
 
 
