@@ -2102,6 +2102,336 @@ InheritableThreadLocal 是 ThreadLocal 的子类，是可以继承父线程创�
 
 
 
+## 31 | Guarded Suspension模式：等待唤醒机制的规范实现
+
+### Guarded Suspension 模式
+
+![在这里插入图片描述](https://img-blog.csdnimg.cn/20191124175740816.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
+
+
+    class GuardedObject<T>{
+      //受保护的对象
+      T obj;
+      final Lock lock =
+    	new ReentrantLock();
+      final Condition done =
+    	lock.newCondition();
+      final int timeout=1;
+      //获取受保护对象  
+      T get(Predicate<T> p) {
+    	lock.lock();
+    	try {
+      		//MESA管程推荐写法
+      		while(!p.test(obj)){
+    			done.await(timeout,
+      			TimeUnit.SECONDS);
+      		}
+    	}catch(InterruptedException e){
+      		throw new RuntimeException(e);
+    	}finally{
+      		lock.unlock();
+    	}
+    	//返回非空的受保护对象
+    	return obj;
+      }
+      //事件通知方法
+      void onChanged(T obj) {
+    	lock.lock();
+    	try {
+      		this.obj = obj;
+      		done.signalAll();
+    	} finally {
+      		lock.unlock();
+    	}
+      }
+    }
+
+
+### 扩展 guarded Suspension 模式
+
+GuardedObject 里面维护一个唯一性 ID 和 GuardedObject 对象的 Map 对象，这样就可以查找到对应的 GuardedObject 了，实现唤醒。
+
+
+    class GuardedObject<T>{
+      //受保护的对象
+      T obj;
+      final Lock lock =
+    new ReentrantLock();
+      final Condition done =
+    lock.newCondition();
+      final int timeout=2;
+      //保存所有GuardedObject
+      final static Map<Object, GuardedObject>
+      gos=new ConcurrentHashMap<>();
+      //静态方法创建GuardedObject
+      static <K> GuardedObject
+      create(K key){
+    GuardedObject go=new GuardedObject();
+    gos.put(key, go);
+    return go;
+      }
+      static <K, T> void
+      fireEvent(K key, T obj){
+    GuardedObject go=gos.remove(key);
+    if (go != null){
+      go.onChanged(obj);
+    }
+      }
+      //获取受保护对象  
+      T get(Predicate<T> p) {
+    lock.lock();
+    try {
+      //MESA管程推荐写法
+      while(!p.test(obj)){
+    done.await(timeout,
+      TimeUnit.SECONDS);
+      }
+    }catch(InterruptedException e){
+      throw new RuntimeException(e);
+    }finally{
+      lock.unlock();
+    }
+    //返回非空的受保护对象
+    return obj;
+      }
+      //事件通知方法
+      void onChanged(T obj) {
+    lock.lock();
+    try {
+      this.obj = obj;
+      done.signalAll();
+    } finally {
+      lock.unlock();
+    }
+      }
+    }
+
+
+## 32 | Balking模式：再谈线程安全的单例模式
+
+当状态满足某个条件时，执行某个业务逻辑，其本质就是一个 if 而已，在多线程场景里，就是一种“多线程版本的 if”。总结成设计模式，叫做 Balking 模式。
+
+
+### Balking 模式的经典实现
+
+    boolean changed=false;
+    //自动存盘操作
+    void autoSave(){
+      synchronized(this){
+    	if (!changed) {
+      		return;
+    	}
+    	changed = false;
+      }
+      //执行存盘操作
+      //省略且实现
+      this.execSave();
+    }
+    //编辑操作
+    void edit(){
+      //省略编辑逻辑
+      ......
+      change();
+    }
+    //改变状态
+    void change(){
+      synchronized(this){
+    	changed = true;
+      }
+    }
+
+
+### 用 volatile 实现 Balking 模式
+
+使用 volatile 的前提是对原子性没有要求。
+
+
+    //路由表信息
+    public class RouterTable {
+      //Key:接口名
+      //Value:路由集合
+      ConcurrentHashMap<String, CopyOnWriteArraySet<Router>>
+    rt = new ConcurrentHashMap<>();
+      //路由表是否发生变化
+      volatile boolean changed;
+      //将路由表写入本地文件的线程池
+      ScheduledExecutorService ses=
+    Executors.newSingleThreadScheduledExecutor();
+      //启动定时任务
+      //将变更后的路由表写入本地文件
+      public void startLocalSaver(){
+    ses.scheduleWithFixedDelay(()->{
+      autoSave();
+    }, 1, 1, MINUTES);
+      }
+      //保存路由表到本地文件
+      void autoSave() {
+    if (!changed) {
+      return;
+    }
+    changed = false;
+    //将路由表写入本地文件
+    //省略其方法实现
+    this.save2Local();
+      }
+      //删除路由
+      public void remove(Router router) {
+    Set<Router> set=rt.get(router.iface);
+    if (set != null) {
+      set.remove(router);
+      //路由表已发生变化
+      changed = true;
+    }
+      }
+      //增加路由
+      public void add(Router router) {
+    Set<Router> set = rt.computeIfAbsent(
+      route.iface, r ->
+    new CopyOnWriteArraySet<>());
+    set.add(router);
+    //路由表已发生变化
+    changed = true;
+      }
+    }
+
+
+单次初始化场景：
+
+
+    class InitTest{
+      boolean inited = false;
+      synchronized void init(){
+    	if(inited){
+      		return;
+    	}
+    	//省略doInit的实现
+    	doInit();
+    	inited=true;
+      }
+    }
+
+
+单例模式的双重检查方案
+
+
+    class Singleton{
+      private static volatile
+    	Singleton singleton;
+      //构造方法私有化  
+      private Singleton() {}
+      //获取实例（单例）
+      public static Singleton
+      getInstance() {
+      	//第一次检查
+    	if(singleton==null){
+      		synchronize{Singleton.class){
+    			//获取锁后二次检查
+    			if(singleton==null){
+      				singleton=new Singleton();
+    			}
+      		}
+      	}
+      	return singleton;
+      }
+    }
+
+
+双重检查中的第一次检查，完全是出于对性能的考量：避免执行加锁操作，因为加锁操作很耗时。加锁之后的二次检查，则是出于对安全性负责。
+
+
+## 33 | Thread-Per-Message模式：最简单实用的分工方法
+
+解决并发编程问题，首要问题也是解决宏观的分工问题。
+
+
+### 如何理解 Thread-Per-Message 模式
+
+委托他人办理的方式，叫做 Thread-Per-Message 模式，简而言之就是为每个任务分配一个独立的线程。
+
+
+### 用 Thread 实现 Thread-Per-Message 模式
+
+Java 线程是和操作系统线程一一对应的，这种做法本质上是将 Java 线程的调度权完全委托给操作系统。这样的好处是稳定、可靠。缺点是创建成本高。线程池是一种解决方案。
+
+另外一种方案是：轻量级线程。轻量级线程创建的成本很低，在创建速度和内存占用比操作系统线程提升了至少一个数量级。例如go 语言、Lua 语言中的协程。
+
+
+### 用 Fiber 实现 Thread-Per-Message 模式
+
+OpenJDK 有个 Loom项目，其中的轻量级线程叫做 Fiber 。
+
+
+    final ServerSocketChannel ssc =
+      ServerSocketChannel.open().bind(
+    new InetSocketAddress(8080));
+    //处理请求
+    try{
+      while (true) {
+    // 接收请求
+    final SocketChannel sc =
+      serverSocketChannel.accept();
+    Fiber.schedule(()->{
+      try {
+    // 读Socket
+    ByteBuffer rb = ByteBuffer
+      .allocateDirect(1024);
+    sc.read(rb);
+    //模拟处理请求
+    LockSupport.parkNanos(2000*1000000);
+    // 写Socket
+    ByteBuffer wb =
+      (ByteBuffer)rb.flip()
+    sc.write(wb);
+    // 关闭Socket
+    sc.close();
+      } catch(Exception e){
+    throw new UncheckedIOException(e);
+      }
+    });
+      }//while
+    }finally{
+      ssc.close();
+    }
+
+
+可以使用 apache betch 压测工具测试。
+
+
+## 34 | Worker Thread模式：如何避免重复创建线程？
+
+在 Java 中频繁地创建、销毁线程非常影响性能，同时无限制地创建线程还可能导致 OOM。使用 Worker Thread 模式可以避免频繁的创建、销毁线程。
+
+
+### Worker Thread 模式及其实现
+
+Worker Thread 模式可以类比现实生活中的车间里的工人场景，有活大家一起干，没活歇着。
+
+![在这里插入图片描述](https://img-blog.csdnimg.cn/20191124180738800.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
+
+
+### 正确地创建线程池
+
+应该创建有限数量的线程和有界的任务队列。同时也应该指明拒绝策略，用于当请求量大于有界队列的容量时，合理的拒绝请求。为了便于调试和诊断问题，建议给线程赋予一个业务相关的名字。
+
+
+    ExecutorService es = new ThreadPoolExecutor(
+      50, 500,
+      60L, TimeUnit.SECONDS,
+      //注意要创建有界队列
+      new LinkedBlockingQueue<Runnable>(2000),
+      //建议根据业务需求实现ThreadFactory
+      r->{
+    	return new Thread(r, "echo-"+ r.hashCode());
+      },
+      //建议根据业务需求实现RejectedExecutionHandler
+      new ThreadPoolExecutor.CallerRunsPolicy());
+    
+
+### 避免线程死锁
+
+如果提交到相同线程池的任务不是相互独立的，而是有依赖关系的，那么就有可能导致线程死锁。
+
+出现问题时，可以通过查看线程栈信息来排查。解决方案可以为不同类型的任务创建不同的线程池。
 
 
 
