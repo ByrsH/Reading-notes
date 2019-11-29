@@ -2434,5 +2434,180 @@ Worker Thread 模式可以类比现实生活中的车间里的工人场景，有
 出现问题时，可以通过查看线程栈信息来排查。解决方案可以为不同类型的任务创建不同的线程池。
 
 
+## 35 | 两阶段终止模式：如何优雅地终止线程？
+
+### 如何理解两阶段终止模式
+
+两阶段终止模式，就是把终止过程分成两个阶段，其中第一个阶段主要是线程 T1 向线程 T2 发送终止指令，第二个阶段则是线程 T2 响应终止指令。
+
+![在这里插入图片描述](https://img-blog.csdnimg.cn/20191129101834565.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
+
+
+Java 线程进入终止状态的前提是线程进入 RUNNABLE 状态，当线程处于休眠状态时，可以通过 interrupt() 方法，将休眠状态的线程转换到 RUNNABLE 状态。
+
+RUNNABLE 状态转换到终止状态，优雅的方式是让 Java 线程自己执行完 run() 方法。一般采用的方法是设置一个标志位，然后线程在合适的时机检查这个标志位，如果发现符合终止条件，则自动退出 run() 方法。
+
+终止指令包括两方面内容： interrupt()  方法和线程终止的标志位。
+
+
+### 用两阶段终止模式终止监控操作
+
+注意 JVM 的异常处理会清除线程的中断状态，所以应该设置自己的线程终止标志位。
+
+
+    class Proxy {
+      //线程终止标志位
+      volatile boolean terminated = false;
+      boolean started = false;
+      //采集线程
+      Thread rptThread;
+      //启动采集功能
+      synchronized void start(){
+    //不允许同时启动多个采集线程
+    if (started) {
+      return;
+    }
+    started = true;
+    terminated = false;
+    rptThread = new Thread(()->{
+      while (!terminated){
+    //省略采集、回传实现
+    report();
+    //每隔两秒钟采集、回传一次数据
+    try {
+      Thread.sleep(2000);
+    } catch (InterruptedException e){
+      //重新设置线程中断状态
+      Thread.currentThread().interrupt();
+    }
+      }
+      //执行到此处说明线程马上终止
+      started = false;
+    });
+    rptThread.start();
+      }
+      //终止采集功能
+      synchronized void stop(){
+    //设置中断标志位
+    terminated = true;
+    //中断线程rptThread
+    rptThread.interrupt();
+      }
+    }
+
+
+### 如何优雅地终止线程池
+
+线程执行 shutdown() 方法后会拒绝接收新的任务，但是会等待线程池中正在执行的任务和已经进入阻塞队列的任务都执行完之后才最终关闭线程池。
+
+线程执行 shutdownNow() 方法后，会拒绝接收新任务，同时还会中断线程池中正在执行的任务，阻塞队列中的任务会作为返回值返回。
+
+
+## 36 | 生产者-消费者模式：用流水线思想提高效率
+
+### 生产者-消费者模式的优点
+
+生产者-消费者模式的核心是一个任务队列，生产者线程生产任务，并将任务添加到任务队列中，而消费者线程从任务队列中获取任务并执行。
+
+![在这里插入图片描述](https://img-blog.csdnimg.cn/20191129102007671.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
+
+生产者-消费者模式的一个重要的优点就是解耦，生产者和消费者之间没有任何依赖关系，它们之间的通信只能通过任务队列。
+
+生产者-消费者模式还有一个重要的优点是支持异步，生产者线程只需将任务添加到任务队列而无需等待任务被执行完。并且能够平衡生产者和消费者的速度差异，通过任务队列来平衡它们之间的速度差异。
+
+
+### 支持批量执行以提升性能
+
+生产者-消费者模式比较适合应用的一个场景是批量执行任务。当批量执行多个任务的性能高于单个多次执行任务时，就可以考虑使用生产者-消费者模式了。消费者可以从队列中获取多个任务，然后再一次批量执行，来提升性能。
+
+
+### 支持分阶段提交以提升性能
+
+可以制定不同的规则，来控制执行任务的时间或者数量。例如日志刷盘，不同等级、时间等规则进行刷盘操作。
+
+
+## 37 | 设计模式模块热点问题答疑
+
+### 避免共享的设计模式
+
+Immutability 模式、Copy-on-Write 模式和线程本地存储模式本质上都是为了避免共享。使用 Immutability 模式需要注意对象属性的不可变性，使用 Copy-on-Write 模式需要注意性能问题，使用线程本地存储需要注意异步执行问题，ThreadLocal 是线程封闭的，不同线程之间不可共享。
+
+
+### 多线程版本 IF 的设计模式
+
+Guarded Suspension 模式和 Balking 模式都可以简单的理解为“多线程版本的 if”，区别在于前者会等待 if 条件变为真，后者则不需要等待。
+
+
+### 三种最简单的分工模式
+
+Thread-Per-Message 模式、Worker Thread 模式和生产者 - 消费者模式是三种最简单使用的多线程分工方法。
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
