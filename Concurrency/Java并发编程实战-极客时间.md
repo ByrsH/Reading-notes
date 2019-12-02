@@ -2543,6 +2543,174 @@ Guarded Suspension 模式和 Balking 模式都可以简单的理解为“多线�
 Thread-Per-Message 模式、Worker Thread 模式和生产者 - 消费者模式是三种最简单使用的多线程分工方法。
 
 
+## 38 | 案例分析（一）：高性能限流器Guava RateLimiter
+
+### 经典限流算法：令牌桶算法
+
+Guava 采用的是令牌桶算法，其核心是要想通过限流器，必须拿到令牌。算法如下：
+
+1. 令牌以固定的速率添加到令牌桶中，假设限流的速率是 r/秒，则令牌每 1/r 秒会添加一个；
+2. 假设令牌桶的容量是 b ，如果令牌桶已满，则新的令牌会被丢弃；
+3. 请求能够通过令牌桶的前提是令牌桶中有令牌。
+
+这里的容量 b 是 burst 的缩写，意义是限流器允许的最大突发流量。同时能够获得 b 个令牌。
+
+在高并发场景下，当系统压力已经临近极限的时候，定时器的精度误差会非常大，同时定时器本身会创建调度线程，也会对系统的性能产生影响。
+
+
+### Guava 如何实现令牌桶算法
+
+Guava 实现令牌桶算法的关键是记录并动态计算下一令牌发放的时间。
+
+    class SimpleLimiter {
+      //当前令牌桶中的令牌数量
+      long storedPermits = 0;
+      //令牌桶的容量
+      long maxPermits = 3;
+      //下一令牌产生时间
+      long next = System.nanoTime();
+      //发放令牌间隔：纳秒
+      long interval = 1000_000_000;
+      
+      //请求时间在下一令牌产生时间之后,则
+      // 1.重新计算令牌桶中的令牌数
+      // 2.将下一个令牌发放时间重置为当前时间
+      void resync(long now) {
+    if (now > next) {
+      //新产生的令牌数
+      long newPermits=(now-next)/interval;
+      //新令牌增加到令牌桶
+      storedPermits=min(maxPermits,
+    storedPermits + newPermits);
+      //将下一个令牌发放时间重置为当前时间
+      next = now;
+    }
+      }
+      //预占令牌，返回能够获取令牌的时间
+      synchronized long reserve(long now){
+    resync(now);
+    //能够获取令牌的时间
+    long at = next;
+    //令牌桶中能提供的令牌
+    long fb=min(1, storedPermits);
+    //令牌净需求：首先减掉令牌桶中的令牌
+    long nr = 1 - fb;
+    //重新计算下一令牌产生时间
+    next = next + nr*interval;
+    //重新计算令牌桶中的令牌
+    this.storedPermits -= fb;
+    return at;
+      }
+      //申请令牌
+      void acquire() {
+    //申请令牌时的时间
+    long now = System.nanoTime();
+    //预占令牌
+    long at=reserve(now);
+    long waitTime=max(at-now, 0);
+    //按照条件等待
+    if(waitTime > 0) {
+      try {
+    TimeUnit.NANOSECONDS
+      .sleep(waitTime);
+      }catch(InterruptedException e){
+    e.printStackTrace();
+      }
+    }
+      }
+    }
+
+
+### 总结
+
+经典的限流算法有：令牌桶算法（Token Bucket），另一个是漏桶算法（Leaky Bucket）。令牌桶算法是从令牌桶中取令牌，只有取到才能通过限流器。漏桶算法是按照一定的速率将水漏掉，只有还能注水的时候，才能通过限流器。
+
+
+## 39 | 案例分析（二）：高性能网络应用框架Netty
+
+### 网络编程的性能瓶颈
+
+![在这里插入图片描述](https://img-blog.csdnimg.cn/20191202123221539.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
+
+![在这里插入图片描述](https://img-blog.csdnimg.cn/20191202123244305.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
+
+
+采用 reactor 模式来实现非阻塞式 API ，从而实现一个线程处理多个连接。
+
+
+### Reactor 模式
+
+![在这里插入图片描述](https://img-blog.csdnimg.cn/2019120212330420.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
+
+主程序启动 Reactor 模式，会循环调用 handle_events() 方法，该方法的核心逻辑是：首先通过同步时间多路选择器提供的 select() 方法监听网络事件，当有网络事件就绪后就遍历事件处理器处理该网络事件。
+
+
+### Netty 中的线程模型
+
+![在这里插入图片描述](https://img-blog.csdnimg.cn/20191202123335253.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
+
+
+一个网络连接在生命周期内只对应一个 EventLoop，一个 EventLoop 对应一个Java线程，但是在 NIO 模型中一个 EventLoop 对应多个连接。
+
+处理 TCP 连接请求和读写请求是通过两个不同的 socket 完成的。在 Netty 中，bossGroup 就用来处理连接请求，而 workerGroup 是用来处理读写请求的。bossGroup 处理完连接请求后，会将这个连接交个workerGroup 处理。
+
+
+### 用 Netty 实现 Echo 程序服务器
+
+默认情况下，Netty 会创建“2*CPU 核数”个 EventLoop。永远不要将一个长时间运行的任务放入到执行队列中，因为它将阻塞需要在同一个线程上执行的任何其他任务。如果必须要要进行阻塞调用或者执行长时间运行的任务，建议使用一个专门的EventExecutor，就是在添加事物处理器handler时（add...方法）指定EventExecutor。当事件到达该handler 时会被这个EventExecutorGroup 中的某个 EventExecutor 处理，从而把它从该 channel 绑定的 EventLoop 队列中移除，这样 EventLoop 能够处理其他的事件任务。
+
+    //事件处理器
+    final EchoServerHandler serverHandler
+      = new EchoServerHandler();
+    //boss线程组  
+    EventLoopGroup bossGroup
+      = new NioEventLoopGroup(1);
+    //worker线程组  
+    EventLoopGroup workerGroup
+      = new NioEventLoopGroup();
+    try {
+      ServerBootstrap b = new ServerBootstrap();
+      b.group(bossGroup, workerGroup)
+       .channel(NioServerSocketChannel.class)
+       .childHandler(new ChannelInitializer<SocketChannel>() {
+     @Override
+     public void initChannel(SocketChannel ch){
+       ch.pipeline().addLast(serverHandler);
+     }
+    });
+      //bind服务端端口  
+      ChannelFuture f = b.bind(9090).sync();
+      f.channel().closeFuture().sync();
+    } finally {
+      //终止工作线程组
+      workerGroup.shutdownGracefully();
+      //终止boss线程组
+      bossGroup.shutdownGracefully();
+    }
+    
+    //socket连接处理器
+    class EchoServerHandler extends
+    ChannelInboundHandlerAdapter {
+      //处理读事件  
+      @Override
+      public void channelRead(
+    ChannelHandlerContext ctx, Object msg){
+      ctx.write(msg);
+      }
+      //处理读完成事件
+      @Override
+      public void channelReadComplete(
+    ChannelHandlerContext ctx){
+      ctx.flush();
+      }
+      //处理异常事件
+      @Override
+      public void exceptionCaught(
+    ChannelHandlerContext ctx,  Throwable cause) {
+      cause.printStackTrace();
+      ctx.close();
+      }
+    }
 
 
 
