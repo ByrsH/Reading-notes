@@ -2714,6 +2714,206 @@ Guava 实现令牌桶算法的关键是记录并动态计算下一令牌发放�
 
 
 
+## 40 | 案例分析（三）：高性能队列Disruptor
+
+Disruptor 是一款高性能的有界内存队列。性能高的原因如下：
+
+1. 内存分配更加合理，使用 RingBuffer 数据结构，数组元素在初始化时全部创建，提高缓存命中率；对象循环利用，避免频繁GC;
+2. 能够避免伪共享，提升缓存利用率；
+3. 采用无锁算法，避免频繁加锁、解锁的性能消耗；
+4. 支持批量消费，消费者可以无锁方式消费多个消息。
+
+
+### RingBuffer 如何提升性能
+
+程序的局部性原理指的是在一段时间内程序的执行会限定在一个局部范围内。时间局部性指的是程序中的某条指令一旦被执行，不久后这条指令很可能再次被执行；如果某条数据被访问，不久后这条数据很可能再次被访问。空间局部性是指某块内存一旦被访问，不久之后这块内存附近的内存也很可能被访问。
+
+CPU 的缓存就利用了程序的局部性原理，如果程序能够利用局部性原理，那么将会提升性能。
+
+RingBuffer 在初始化时会创建所有元素，所以这些元素的地址大概率是连续的，这就利用上了 CPU 加载缓存的优化。另外生产者在发布 Event 的时候，并不是创建一个新的 Event，而是通过 event.set() 方法更改 Event，这样 RingBuffer 创建的 Event 是可以循环利用的，还能避免频繁创建、删除 Event 导致的频繁 GC 问题。
+
+
+### 如何避免伪共享
+
+伪共享指的是由于共享缓存行导致缓存无效的场景。比如缓存行中的某个变量被修改缓存无效，导致缓存行中的其他变量也变为无效，从而不能利用缓存。
+
+为了避免伪共享，可以通过缓存行填充的技术，使每个变量独占一个缓存行、不共享缓存行。
+
+
+    //前：填充56字节
+    class LhsPadding{
+    	long p1, p2, p3, p4, p5, p6, p7;
+    }
+    class Value extends LhsPadding{
+    	volatile long value;
+    }
+    //后：填充56字节
+    class RhsPadding extends Value{
+    	long p9, p10, p11, p12, p13, p14, p15;
+    }
+    class Sequence extends RhsPadding{
+      //省略实现
+    }
+
+
+### Disruptor 中的无锁算法
+
+Disruptor 使用 CAS（Compare And Swap/Set）操作。这是一个 CPU 级别的指令，原理类似于乐观锁。CAS 操作比锁消耗的资源少很多，因为它不牵扯操作系统，直接在 CPU 上操作。
+
+当只有一个生产者时，不使用锁，也不使用 CAS。
+
+
+### 总结
+
+Disruptor 的优化思路大体分为两个方面：一个是利用无锁算法避免锁的争用，另一个是将硬件（CPU）的性能发挥极致。
+
+Java 8 中提供了避免伪共享的注解：@sun.misc.Contended，需要设置 jvm 的参数 -XX:-RestrictContended。避免伪共享的代价是牺牲内存，请谨慎使用。
+
+
+## 41 | 案例分析（四）：高性能数据库连接池HiKariCP
+
+### 什么是数据库连接池
+
+![在这里插入图片描述](https://img-blog.csdnimg.cn/20191208185111411.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTA2NTcwOTQ=,size_16,color_FFFFFF,t_70)
+
+### FastList 解决了哪些性能问题
+
+FastList 是 HiKariCP 新的数据结构，相较于 ArrayList 优化了 remove(Object element) 方法的查找顺序变为逆序查找。另个一是保证了get(index) 参数不会越界，没有对 index 进行越界检查。
+
+
+### ConcurrentBag 解决了哪些性能问题
+
+核心设计使用 ThreadLocal 避免部分并发问题。
+
+
+## 42 | Actor模型：面向对象原生的并发模型
+
+### Hello Actor 模型
+
+Actor 模型本质上是一种计算模型，基本的计算单元称为 Actor。在 Actor 模型中，所有的计算都是在 Actor 中执行的。Actor 模型也被认为是一种并发计算模型。目前 Java 领域能完备地支持 Actor 模型而且比较成熟的类库就是 Akka.
+
+    //该Actor当收到消息message后，
+    //会打印Hello message
+    static class HelloActor
+    	extends UntypedActor {
+      @Override
+      public void onReceive(Object message) {
+    	System.out.println("Hello " + message);
+      }
+    }
+    
+    public static void main(String[] args) {
+      //创建Actor系统
+      ActorSystem system = ActorSystem.create("HelloSystem");
+      //创建HelloActor
+      ActorRef helloActor =
+    	system.actorOf(Props.create(HelloActor.class));
+      //发送消息给HelloActor
+      helloActor.tell("Actor", ActorRef.noSender());
+    }
+
+
+### 消息和对象方法的区别
+
+Actor 内部的工作模式可以类比为只有一个消费者线程的生产者-消费者模式。Actor 中的消息机制完全是异步的。而调用对象方法是同步的。
+
+调用对象的方法，需要持有对象的引用，所有的对象必须在同一个进程中。而在 Actor 中，发送消息和接收消息的 Actor 可以不在一个进程中，也可以不在同一台机器上。Actor 不但适合并发计算，还使用于分布式计算。
+
+
+### Actor 的规范化定义
+
+包含三部分能力：
+
+1. 处理能力，处理接收到的消息。
+2. 存储能力，Actor 可以存储自己的内部状态，且内部状态在不同 Actor 之间是绝对隔离的。
+3. 通信能力，Actor 可以和其他 Actor 之间通信。
+
+
+Actor 接收到一个消息后，可以做下面三件事：
+
+1. 创建更多的 Actor；
+2. 发消息给其他 Actor；
+3. 确定如何处理下一条消息；
+
+### 用 Actor 实现累加器
+
+
+    //累加器
+    static class CounterActor extends UntypedActor {
+      private int counter = 0;
+      @Override
+      public void onReceive(Object message){
+    //如果接收到的消息是数字类型，执行累加操作，
+    //否则打印counter的值
+    if (message instanceof Number) {
+      counter += ((Number) message).intValue();
+    } else {
+      System.out.println(counter);
+    }
+      }
+    }
+    public static void main(String[] args) throws InterruptedException {
+      //创建Actor系统
+      ActorSystem system = ActorSystem.create("HelloSystem");
+      //4个线程生产消息
+      ExecutorService es = Executors.newFixedThreadPool(4);
+      //创建CounterActor
+      ActorRef counterActor =
+    system.actorOf(Props.create(CounterActor.class));
+      //生产4*100000个消息
+      for (int i=0; i<4; i++) {
+    es.execute(()->{
+      for (int j=0; j<100000; j++) {
+    counterActor.tell(1, ActorRef.noSender());
+      }
+    });
+      }
+      //关闭线程池
+      es.shutdown();
+      //等待CounterActor处理完所有消息
+      Thread.sleep(1000);
+      //打印结果
+      counterActor.tell("", ActorRef.noSender());
+      //关闭Actor系统
+      system.shutdown();
+    }
+
+
+### 总结
+
+Actor 模型理论上不保证消息百分百送达，也不保证消息送达的顺序和发送的顺序是一致的，甚至无法保证消息会被百分百处理。
+
+
+## 43 | 软件事务内存：借鉴数据库的并发经验
+借鉴数据库的事务管理，总结出新的并发解决方案：软件事务内存（Software Transactional Memory，简称 STM）。传统数据库事务支持4个特性：原子性（Atomicity）、一致性（Consistency）、隔离性（Isolation）和持久性（Durability）。STM 不涉及持久化。
+
+
+### 用 STM 实现转账
+
+借助第三方类库 Multiverse 来实现转账程序：
+
+
+    class Account{
+      //余额
+      private TxnLong balance;
+      //构造函数
+      public Account(long balance){
+    	this.balance = StmUtils.newTxnLong(balance);
+      }
+      //转账
+      public void transfer(Account to, int amt){
+    	//原子化操作
+    	atomic(()->{
+      		if (this.balance.get() > amt) {
+    		this.balance.decrement(amt);
+    		to.balance.increment(amt);
+      	}
+    	});
+      }
+    }
+
+
+MVCC（Multi-Version Concurrency Control）多版本并发控制。在事务开启时，会给数据库打一个快照，以后所有的读写都是基于这个快照。提交事务时，如果所有读写过的数据在该事务执行期间没有发生变化，那么就可以提交；如果发生变化，说明该事务和其他事务读写的数据冲突了，这时是不可以提交的。可以通过给每条数据增加一个版本号，来记录数据是否放生了变化。
 
 
 
