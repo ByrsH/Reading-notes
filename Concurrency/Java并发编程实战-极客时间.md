@@ -2916,6 +2916,88 @@ Actor 模型理论上不保证消息百分百送达，也不保证消息送达�
 MVCC（Multi-Version Concurrency Control）多版本并发控制。在事务开启时，会给数据库打一个快照，以后所有的读写都是基于这个快照。提交事务时，如果所有读写过的数据在该事务执行期间没有发生变化，那么就可以提交；如果发生变化，说明该事务和其他事务读写的数据冲突了，这时是不可以提交的。可以通过给每条数据增加一个版本号，来记录数据是否放生了变化。
 
 
+## 44 | 协程：更轻量级的线程
+
+协程可以理解为一种轻量级的线程。线程是在内核态中调度的，而协程是在用户态调度的。相比于线程，协程切换的成本更低。
+
+
+### Golang 中的协程
+
+    
+    import (
+      "fmt"
+      "time"
+    )
+    func hello(msg string) {
+      fmt.Println("Hello " + msg)
+    }
+    func main() {
+      //在新的协程中执行hello方法
+      go hello("World")
+      fmt.Println("Run in main")
+      //等待100毫秒让协程执行结束
+      time.Sleep(100 * time.Millisecond)
+    }
+
+
+### 利用协程实现同步
+
+基于协程实现同步非阻塞方案。
+
+    -- 创建socket
+    local sock = ngx.socket.tcp()
+    -- 设置socket超时时间
+    sock:settimeouts(connect_timeout, send_timeout, read_timeout)
+    -- 连接到目标地址
+    local ok, err = sock:connect(host, port)
+    if not ok then
+    -  -- 省略异常处理
+    end
+    -- 发送请求
+    local bytes, err = sock:send(request_data)
+    if not bytes then
+      -- 省略异常处理
+    end
+    -- 读取响应
+    local line, err = sock:receive()
+    if err then
+      -- 省略异常处理
+    end
+    -- 关闭socket
+    sock:close()   
+    -- 处理读取到的数据line
+    handle(line)
+
+
+### 结构化并发编程
+
+三种基本的控制结构是：顺序结构、选择结构和循环结构。
+
+上述的结构都是由一个入口和一个出口，中间不管怎样组合都最终汇聚到一个出口。而结构化并发编程，不管是创建线程还是协程，都会出现不同的分支，而且最终是不汇聚的，因此也不是线性的。所以被某些人认为是违背了结构化程序设计。
+
+
+## 45 | CSP模型：Golang的主力队员
+
+Golang 解决协程之间的协作问题：一种是支持协程之间以共享内存的方式通信，Golang 提供了管程和原子类来对协程进行同步控制；另一种方案是支持协程之间以消息传递（Message-Passing）的方式通信，本质上是要避免共享，Golang 的这个方案是基于 CSP（Communication Sequential Processes）模型实现的。
+
+
+### 什么是 CSP 模型
+
+CSP模型与 Actor 模型很相似。Golang 中推荐以通信的方式共享内存。Golang 中协程之间通信推荐的是使用 channel。
+
+
+### CSP 模型与生产者-消费者模式
+
+channel 可以类比为生产者-消费者模式中的阻塞队列。channel 的容量为 0 时，被称为无缓冲的 channel，容量大于 0 的则被称为有缓冲的 channel。
+
+
+### CSP 模型与 Actor 模型的区别
+
+第一个区别是：Actor 模型中没有 channel。
+
+第二个区别是：Actor 模型中发送消息是非阻塞的，而 CSP 模型中是阻塞的。
+
+第三个区别是：Actor 模型理论上不保证百分百送达，CSP 模型中能保证消息百分百送达，但同时有死锁的风险。
 
 
 
